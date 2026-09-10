@@ -52,6 +52,29 @@ Velocidad (medianas por contexto):
 
 **Confusor:** `candidate_runner.py` no llamaba `graph_selected_mlps()`, que los probes Minima/híbrido sí usaban (grafos CUDA por MLP para Q≤7). Los 192 MLP corrieron eager en cada verify: ~400 lanzamientos extra desde Python por forward, que pesan más cuanto más corto es el contexto (−17% a 4K/32K, −3% a 131K). La caída de aceptación (−3,5 pp) no puede explicarse por grafos (misma aritmética); es ruido de trayectoria o efecto real del donante, y se decide con la repetición. El runner ahora captura grafos por defecto (`--no-graph-mlp` para reproducir `64d`) y registra `mlp_graphs` y `graphs.json`. Repetición: `candidate-nvidia64e`.
 
+## A/B `candidate-nvidia64e` (adaptador corregido, MLP con grafos) — resultado de Fase 1 para NVIDIA
+
+Misma matriz y controles; 64 MLP capturados (`graphs.json`). `gate-decision-nvidia64e.json`:
+
+| Criterio | Control EXL3 | NVIDIA64 (grafos) | Puerta |
+|---|---:|---:|---|
+| Código (16 celdas) | 11/16 | 11/16 | pasa (≥) |
+| JSON | 2/2 | 2/2 | pasa |
+| Aceptación MTP, mediana código | 0,735 | 0,693 (−4,26 pp) | **falla** |
+| Pico asignado | 24,79 GiB | 23,81 GiB (−0,98) | pasa |
+
+Fallos del candidato: `bucket-32768-1` y `bucket-131072-1` truncados a 4.089; `lru-131072-1` y `ttl-131072-1` con un error en un test generado (oráculo 7/7 en ambos); `ttl-131072-0` una expectativa errónea (oráculo 7/7). Las 14 implementaciones ejecutadas pasan el oráculo independiente. Familias: lru 3/4, ring 4/4, bucket 2/4, ttl 2/4 (control: 4/4, 4/4, 1/4, 2/4).
+
+| Contexto | TTFT control | TTFT NVIDIA64 | Δ | Decode control | Decode 64d (eager) | Decode 64e (grafos) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4K (warmup) | 2,68 s | 1,23 s | −54% | 242 | 200 | 235 |
+| 32K | 11,06 s | 6,42 s | **−42%** | 195,1 | 162,8 | 189,2 |
+| 131K | 68,98 s | 50,61 s | **−27%** | 143,1 | 138,5 | 146,3 |
+
+Los grafos recuperan el decode (−3% a 32K, +2% a 131K): el −17% de `64d` era íntegramente la omisión del runner. La aceptación MTP baja de forma consistente en las dos corridas (−3,5 y −4,3 pp; por celda el candidato tiene 0,58–0,79 frente a 0,65–0,80 del control). Interpretación: el drafter MTP es EXL3 y propone contra la distribución del target EXL3; sustituir 192 MLP por otra cuantización desplaza ligeramente esa distribución y el verificador rechaza algo más. No se traduce en pérdida de tok/s ni de calidad en esta matriz, pero el criterio 3 se fijó en ±3 pp antes de medir y **no se cumple**. Relajarlo es una decisión del usuario, no de esta corrida.
+
+Corridas intermedias conservadas: `qg10-nvidia64e-managed-gpu-busy` (el worker anterior tardó >60 s en liberar la GPU tras `systemctl stop`; `managed.py` abortó y restauró sin ejecutar nada).
+
 ## Hallazgo: las convenciones de escalas de NVIDIA y Unsloth son inversas
 
 Medido directamente en `model.language_model.layers.0.mlp.gate_proj` (misma matriz lógica en ambos checkpoints):
