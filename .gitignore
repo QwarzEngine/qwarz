@@ -1,0 +1,15 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+results/
+benchmarks/baselines/
+*.log
+.idea/
+.vscode/
+target/
+state/

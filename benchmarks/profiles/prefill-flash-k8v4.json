@@ -1,0 +1,8 @@
+{
+  "name": "flash_chunk8192",
+  "implementation": "torch_flash",
+  "staging": 1,
+  "minimum_query": 17,
+  "chunk_size": 8192,
+  "kwargs": {}
+}

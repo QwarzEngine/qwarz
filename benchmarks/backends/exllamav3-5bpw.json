@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "status": "local_artifact_hashed_weight_shards_verified",
+  "target": {
+    "repository": "thelastspark/Qwen3.8-27B-exl3",
+    "revision": "1a6fe4afb5b921fda9f93fd4b06d6c6d5c99a62c",
+    "branch": "5.00bpw",
+    "decoder_bpw": 5.0,
+    "head_bits": 6,
+    "mtp_bits": 4,
+    "weight_bytes": 19901680029,
+    "local_path_env": "QWASAR_MODEL_PATH",
+    "local_tree_sha256": "0b9a439ffefa45c55a2a3cb0324de9fe1b23bce69a37a399cb952d355f02d92e",
+    "weight_files": [
+      {
+        "path": "model-00001-of-00003.safetensors",
+        "bytes": 8509808537,
+        "sha256": "9c61af94100858ddd93b2195c1d529b8b0865a7f0c920e6b05a3c1fa44df4c6e"
+      },
+      {
+        "path": "model-00002-of-00003.safetensors",
+        "bytes": 8589756567,
+        "sha256": "32fa6ee929a5aa1e9c9ae79d9c9b29cba5c8d023fcfd88be5ae57d927e1e5a91"
+      },
+      {
+        "path": "model-00003-of-00003.safetensors",
+        "bytes": 2802114925,
+        "sha256": "b24f78f172a524b74d896c07297623f01c1569e9c2ab49ab85a3c64d997d4fce"
+      }
+    ],
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "draft": {
+    "repository": "Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw",
+    "revision": "4f0436269bca761b071f05319e8e04a87cc633f9",
+    "local_path": "/home/rekeyea/models/Qwen3.8-27B-DFlash2-EXL3-5.0bpw",
+    "local_tree_sha256": "27beac851476f38a9602e3baeff34087dc37e897105ca5ed0a220d4cc415a29f",
+    "weight_sha256": "6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56"
+  },
+  "oracle_server": {
+    "repository_path": "/home/rekeyea/Documents/llm/qwen38-exl3-mia",
+    "git_revision": "1242187390f780dba907e30659f1639fd0b491c8",
+    "working_tree_clean": false,
+    "modified_paths": [
+      "start.sh",
+      "tools/serve_openai.py"
+    ],
+    "working_tree_diff_sha256": "cd4f2f8a8bc26777ff6d0cb10700b86a031d63f5121cf0460b7be5e07f82e730",
+    "start_script_sha256": "9b2cdb50b17deb5d0eeea92f5a63a9c98fad9fc54fd21282da36063d41f3ec56",
+    "server_script_sha256": "c696c060b2a58fbc989b8145e81f0fb8c4745dfa412ae441445ee3fe86363f3a",
+    "protocol": "chat-completions",
+    "health_path": "/health"
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "exllamav3_version": "1.4.2",
+    "exllamav3_repository": "https://github.com/MiaAI-Lab/exllamav3",
+    "exllamav3_revision": "63b32f001d7b2cfed3b3e3aaf25f534ba53cc7ed",
+    "target_quantizer_version": "1.4.3+unified.1",
+    "torch_version": "2.14.0+cu130",
+    "torch_cuda": "13.0",
+    "aiohttp_version": "3.14.3",
+    "cuda_visible_devices": "0",
+    "context_tokens": 262144,
+    "cache_quantization": "nvfp4",
+    "draft_method": "dflash2",
+    "cpu_cache_gb": 0
+  }
+}

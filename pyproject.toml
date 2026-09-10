@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qwasar-bench"
+version = "0.1.0"
+description = "Reproducible benchmark and oracle harness for Qwasar"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+qwasar-bench = "qwasar_bench.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9"]
+benchmark = ["tokenizers>=0.21,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qwasar_bench", "src/qwasar_runtime"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

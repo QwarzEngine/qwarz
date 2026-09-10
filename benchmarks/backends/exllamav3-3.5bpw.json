@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "status": "bringup_ready",
+  "qualification": "bringup_only",
+  "target": {
+    "repository": "Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw",
+    "revision": "19441ac874c4018295da848e250f23511361cda4",
+    "decoder_bpw": 3.5,
+    "weight_bytes": 15338408461,
+    "local_path": "/home/rekeyea/models/Qwen3.8-27B-EXL3-3.5bpw",
+    "local_tree_sha256": "46a6f5063122b5068a22cf0c4316bcdb3e40678d93081a3c3d178a502ffe9195",
+    "weight_files": [
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "bytes": 8530774298,
+        "sha256": "7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6"
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "bytes": 6807634163,
+        "sha256": "411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2"
+      }
+    ],
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "draft_profile": "benchmarks/backends/exllamav3-5bpw.json#draft",
+  "runtime_profile": "benchmarks/backends/exllamav3-5bpw.json#runtime",
+  "acceptance_restrictions": [
+    "Cannot establish final coding-quality parity for a 4.5-5.0 bpw Q38X candidate.",
+    "Cannot be compared directly with the EXL3 5.0 bpw acceptance baseline.",
+    "May be used for API, session, cancellation, recovery, memory-layout, and performance bring-up."
+  ]
+}

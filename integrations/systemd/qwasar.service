@@ -1,0 +1,28 @@
+[Unit]
+Description=Qwasar Qwen3.8-27B EXL3 5bpw + MTP + K8/V4 (RTX 5090)
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=%h/Documents/llm/qwasar
+Environment="PATH=/opt/cuda/bin:/usr/local/bin:/usr/bin"
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="CUDA_HOME=/opt/cuda"
+Environment="QWASAR_MODEL_PATH=%h/models/Qwen3.8-27B-EXL3-5.0bpw"
+Environment="QWASAR_EXLLAMA_PYTHON=%h/Documents/llm/qwen38-exl3-mia/.venv/bin/python"
+Environment="HF_HUB_OFFLINE=1"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py serve --prefill flash
+ExecStartPost=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py wait-ready --pid ${MAINPID}
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=360
+TimeoutStopSec=45
+KillMode=mixed
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qwasar
+
+[Install]
+WantedBy=default.target

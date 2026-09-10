@@ -1,0 +1,12 @@
+{
+  "extends": "qwen38-27b-rtx5090-v1.json",
+  "model": {
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "repository": "Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw",
+    "quantization": "EXL3",
+    "target_bpw": 3.5,
+    "native_context_tokens": 262144,
+    "artifact_path_env": "QWASAR_MODEL_PATH",
+    "artifact_sha256": "46a6f5063122b5068a22cf0c4316bcdb3e40678d93081a3c3d178a502ffe9195"
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "model": {
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "repository": "Qwen/Qwen3.8-27B",
+    "quantization": "EXL3",
+    "target_bpw": 5.0,
+    "native_context_tokens": 262144,
+    "artifact_path_env": "QWASAR_MODEL_PATH",
+    "artifact_sha256": "0b9a439ffefa45c55a2a3cb0324de9fe1b23bce69a37a399cb952d355f02d92e"
+  },
+  "generation": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_output_tokens": 256,
+    "seed": 0
+  },
+  "cases": [
+    {
+      "case_id": "fresh-coding-1k",
+      "fixture_id": "coding-smoke",
+      "mode": "fresh_prefill",
+      "context_bucket": "1k",
+      "target_context_tokens": 768,
+      "appended_tokens": 768,
+      "warmups": 1,
+      "repetitions": 5,
+      "session_id": null,
+      "turn_index": null
+    },
+    {
+      "case_id": "fresh-retrieval-32k",
+      "fixture_id": "retrieval-smoke",
+      "mode": "fresh_prefill",
+      "context_bucket": "32k",
+      "target_context_tokens": 32000,
+      "appended_tokens": 32000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": null,
+      "turn_index": null
+    },
+    {
+      "case_id": "fresh-retrieval-128k",
+      "fixture_id": "retrieval-smoke",
+      "mode": "fresh_prefill",
+      "context_bucket": "128k",
+      "target_context_tokens": 130000,
+      "appended_tokens": 130000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": null,
+      "turn_index": null
+    },
+    {
+      "case_id": "fresh-retrieval-256k",
+      "fixture_id": "retrieval-smoke",
+      "mode": "fresh_prefill",
+      "context_bucket": "256k",
+      "target_context_tokens": 261000,
+      "appended_tokens": 261000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": null,
+      "turn_index": null
+    },
+    {
+      "case_id": "persistent-1k-seed",
+      "fixture_id": "agent-seed",
+      "mode": "persistent_turn",
+      "context_bucket": "1k",
+      "target_context_tokens": 384,
+      "appended_tokens": 384,
+      "warmups": 1,
+      "repetitions": 5,
+      "session_id": "agent-1k",
+      "turn_index": 0
+    },
+    {
+      "case_id": "persistent-1k-turn",
+      "fixture_id": "agent-turn",
+      "mode": "persistent_turn",
+      "context_bucket": "1k",
+      "target_context_tokens": 512,
+      "appended_tokens": 128,
+      "warmups": 1,
+      "repetitions": 5,
+      "session_id": "agent-1k",
+      "turn_index": 1
+    },
+    {
+      "case_id": "persistent-32k-seed",
+      "fixture_id": "agent-seed",
+      "mode": "persistent_turn",
+      "context_bucket": "32k",
+      "target_context_tokens": 32000,
+      "appended_tokens": 32000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": "agent-32k",
+      "turn_index": 0
+    },
+    {
+      "case_id": "persistent-32k-turn",
+      "fixture_id": "agent-turn",
+      "mode": "persistent_turn",
+      "context_bucket": "32k",
+      "target_context_tokens": 32128,
+      "appended_tokens": 128,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": "agent-32k",
+      "turn_index": 1
+    },
+    {
+      "case_id": "persistent-128k-seed",
+      "fixture_id": "agent-seed",
+      "mode": "persistent_turn",
+      "context_bucket": "128k",
+      "target_context_tokens": 130000,
+      "appended_tokens": 130000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": "agent-128k",
+      "turn_index": 0
+    },
+    {
+      "case_id": "persistent-128k-turn",
+      "fixture_id": "agent-turn",
+      "mode": "persistent_turn",
+      "context_bucket": "128k",
+      "target_context_tokens": 130128,
+      "appended_tokens": 128,
+      "warmups": 1,
+      "repetitions": 5,
+      "session_id": "agent-128k",
+      "turn_index": 1
+    },
+    {
+      "case_id": "persistent-256k-seed",
+      "fixture_id": "agent-seed",
+      "mode": "persistent_turn",
+      "context_bucket": "256k",
+      "target_context_tokens": 261000,
+      "appended_tokens": 261000,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": "agent-256k",
+      "turn_index": 0
+    },
+    {
+      "case_id": "persistent-256k-turn",
+      "fixture_id": "agent-turn",
+      "mode": "persistent_turn",
+      "context_bucket": "256k",
+      "target_context_tokens": 261128,
+      "appended_tokens": 128,
+      "warmups": 1,
+      "repetitions": 3,
+      "session_id": "agent-256k",
+      "turn_index": 1
+    }
+  ]
+}

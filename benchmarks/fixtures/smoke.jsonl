@@ -1,0 +1,6 @@
+{"fixture_id":"coding-smoke","category":"coding","input":"Complete the Python function while preserving its public API and explain the complexity.","filler_seed":1101}
+{"fixture_id":"tool-call-smoke","category":"tool_call","input":"Inspect the repository and call the supplied search tool with valid JSON arguments.","filler_seed":2202}
+{"fixture_id":"retrieval-smoke","category":"long_context_retrieval","input":"Find the uniquely marked function in the provided synthetic repository context and report its contract.","filler_seed":3303}
+{"fixture_id":"multilingual-smoke","category":"multilingual_technical","input":"Corrige el error de concurrencia sin cambiar la interfaz pública y resume la causa raíz.","filler_seed":4404}
+{"fixture_id":"agent-seed","category":"agent_loop","input":"You are editing a repository. Read the supplied files, identify the smallest safe change, and retain the working context for the next turn.","filler_seed":5505}
+{"fixture_id":"agent-turn","category":"agent_loop","input":"Now apply the requested follow-up using the existing repository context and return a concise diff summary.","filler_seed":6606}
