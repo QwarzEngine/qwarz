@@ -1,6 +1,6 @@
 # Donante NVIDIA NVFP4 (Fase 1) — 2026-09-10
 
-**Estado:** checkpoint verificado, adaptador con inversión de **ambas** escalas globales, oráculo de cuatro puertas pasado (`qg10-nvchk10-managed`, `nvidia-check10/report.json`). A/B NVIDIA-MLP64 sobre la matriz congelada relanzado (`candidate-nvidia64d`).
+**Estado:** checkpoint verificado, adaptador con inversión de **ambas** escalas globales, oráculo de cuatro puertas pasado (`nvidia-check10`). A/B completo sobre la matriz congelada: **NVIDIA64 = control en código (11/16), JSON 2/2, −0,98 GiB, TTFT −42% (32K) / −27% (131K), decode a la par; aceptación MTP −4,3 pp (falla el criterio 3 de ±3 pp)**. Minima64 en la misma matriz: 8/16, −5,8 pp. Ganador de Fase 1: NVIDIA64; promoción pendiente de la decisión del usuario sobre el criterio 3. Detalle al final.
 
 ## Corrección (18:00): el primer A/B produjo ruido en 19/19 celdas con el oráculo en verde
 
@@ -74,6 +74,27 @@ Fallos del candidato: `bucket-32768-1` y `bucket-131072-1` truncados a 4.089; `l
 Los grafos recuperan el decode (−3% a 32K, +2% a 131K): el −17% de `64d` era íntegramente la omisión del runner. La aceptación MTP baja de forma consistente en las dos corridas (−3,5 y −4,3 pp; por celda el candidato tiene 0,58–0,79 frente a 0,65–0,80 del control). Interpretación: el drafter MTP es EXL3 y propone contra la distribución del target EXL3; sustituir 192 MLP por otra cuantización desplaza ligeramente esa distribución y el verificador rechaza algo más. No se traduce en pérdida de tok/s ni de calidad en esta matriz, pero el criterio 3 se fijó en ±3 pp antes de medir y **no se cumple**. Relajarlo es una decisión del usuario, no de esta corrida.
 
 Corridas intermedias conservadas: `qg10-nvidia64e-managed-gpu-busy` (el worker anterior tardó >60 s en liberar la GPU tras `systemctl stop`; `managed.py` abortó y restauró sin ejecutar nada).
+
+## Minima64 sobre la misma matriz (`candidate-minima64a`) y decisión de Fase 1
+
+Mismo runner, grafos activos, 192 proyecciones reemplazadas. `gate-decision-minima64a.json`:
+
+| Criterio | Control EXL3 | NVIDIA64 | Minima64 |
+|---|---:|---:|---:|
+| Código (16) | 11/16 | **11/16** | 8/16 |
+| — lru / ring / bucket / ttl | 4/4 · 4/4 · 1/4 · 2/4 | 3/4 · 4/4 · 2/4 · 2/4 | 2/4 · 2/4 · 1/4 · 3/4 |
+| — truncados a 4.089 | 1 | 2 | **4** |
+| JSON | 2/2 | 2/2 | 2/2 |
+| Aceptación MTP (mediana código) | 0,735 | 0,693 (−4,3 pp) | 0,677 (−5,8 pp) |
+| Pico asignado | 24,79 GiB | 23,81 | 23,81 |
+| TTFT 32K / 131K | 11,06 s / 68,98 s | **6,42 s / 50,61 s** | 6,65 s / 51,71 s |
+| Decode 32K / 131K | 195 / 143 | 189 / 146 | 188 / 141 |
+
+Los 12 programas de Minima que se ejecutaron pasan el oráculo independiente 7/7; sus fallos son 4 truncados (razonamiento más largo) y 4 tests generados con una expectativa errónea. Es un modelo algo más verboso y menos alineado con el drafter, no uno roto. La muestra previa de 6 celdas LRU (4/6) había sobreestimado su paridad con el control.
+
+**Decisión Fase 1:** el donante para Fase 2 es **NVIDIA64**. Supera a Minima64 en código (11 vs 8), aceptación (−4,3 vs −5,8 pp), TTFT (3–4% mejor) y decode (+2% vs −1% a 131K). Frente al control cumple los criterios 1, 2 y 4 y **no** cumple el 3 (±3 pp) en dos corridas independientes. Ese criterio es un proxy de desplazamiento de distribución, no una métrica de usuario: el desplazamiento existe (~4 pp menos aceptación) pero no cuesta ni calidad ni tok/s en esta matriz. La promoción a Fase 2 requiere que el usuario decida si relaja el criterio 3 (por ejemplo a ±5 pp, o sustituirlo por «decode tok/s ≥ control −5%») o si exige recuperar la aceptación (ninguna palanca conocida: el drafter MTP es EXL3 y fijo).
+
+Artefactos: `candidate-nvidia64{d,e}`, `candidate-minima64a`, `grades-candidate-*`, `gate-decision-{nvidia64d,nvidia64e,minima64a}.json`.
 
 ## Hallazgo: las convenciones de escalas de NVIDIA y Unsloth son inversas
 

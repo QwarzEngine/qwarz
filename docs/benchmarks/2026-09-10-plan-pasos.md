@@ -11,7 +11,7 @@ Mejorar Qwasar (Qwen 3.8 27B, RTX 5090, 32 GB, MTP6, K8/V4, 256K) sin sustituir 
 | Fase | Qué | Estado |
 |---|---|---|
 | 0 | Puerta de calidad ampliada + baseline EXL3 | **Congelada.** Control 11/16 código, JSON 2/2, pico 24,79 GiB. |
-| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Adaptador corregido** (faltaba invertir `input_scale`; el A/B `nvidia64b` era ruido en 19/19 con el oráculo en verde). Oráculo de 4 puertas pasado (`nvidia-check10`). A/B relanzado como `candidate-nvidia64d`. Ver [donante](2026-09-10-nvidia-donor.md). |
+| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Medida completa.** Adaptador corregido (faltaba invertir `input_scale`; `nvidia64b` era ruido con el oráculo en verde), oráculo de 4 puertas (`nvidia-check10`). `candidate-nvidia64e`: código 11/16 = control, JSON 2/2, −0,98 GiB, TTFT −42%/−27%, decode a la par, **aceptación MTP −4,3 pp (falla ±3 pp)**. `candidate-minima64a`: 8/16, −5,8 pp. Ganador: NVIDIA64. Promoción bloqueada en el criterio 3 — decisión del usuario. Ver [donante](2026-09-10-nvidia-donor.md). |
 | 2 | Ganador de Fase 1 + FP8 PRIMS (P×256) + Attention64 + K8/V4 + MTP6 → producción | No empezada. Esperado (medido en híbrido previo): TTFT 258K ~132→~69 s no se reclama hasta medirlo otra vez sobre el ganador. |
 | 3 | Decode: XQA + KV NVFP4 en target, resolviendo antes el runtime de cola FP16 2K | No empezada. Bloqueo conocido: XQA local no expone LSE; el prototipo SGLang anterior tuvo acceso ilegal. |
 | 4 | Cabeza MTP 64K (la memoria la paga Fase 3). Métrica: tiempo por token aceptado | No empezada. |
@@ -51,9 +51,10 @@ El error final es de nombres, no de GPU: el artefacto EXL3 **no guarda** `.weigh
 ## Próximos pasos concretos (en este orden)
 
 1. ~~Oráculo de dos puertas~~ **Hecho, y ampliado a cuatro** (18:00). Las puertas A/B pasaron con un adaptador que dejaba `input_scale` sin invertir; el A/B `candidate-nvidia64b` salió ruido en 19/19 celdas. Lección: un oráculo que cuantiza la referencia con los mismos globales que el kernel no detecta convenciones erradas; hace falta una referencia con activaciones sin cuantizar (Puerta C), una ida y vuelta de activaciones (Puerta D) y un brazo rojo que reproduzca el bug conocido. `nvidia-check10`: A 48/48, B 12/12, C 48/48 (máx 0,098), D 48/48 (máx 0,096), rojo 8/8 = 1,0.
-2. **En curso:** A/B **NVIDIA-MLP64** (`candidate-nvidia64d`) sobre `prompts.json` congelado, FP8 PRIMS y Attention64 apagados. Antes de calificar, inspeccionar las completions a ojo: el runner no detecta ruido por sí solo.
-3. Calificar con `graders.py`, decidir con `aggregate.py` contra el baseline 11/16 (`--control control,control-ttl2`).
-4. El ganador entra a Fase 2. Si NVIDIA no supera 11/16, Minima64 (4/6 medido) es el candidato por defecto.
+2. ~~A/B NVIDIA-MLP64~~ **Hecho** (`candidate-nvidia64d` eager, `candidate-nvidia64e` con grafos MLP). El runner omitía `graph_selected_mlps()` y `64d` perdió −17% de decode a 32K por lanzamientos Python; `64e` lo recupera (−3%/+2%). El runner captura grafos por defecto.
+3. ~~Calificar y decidir~~ **Hecho.** `aggregate.py` tenía dos bugs (nunca había corrido): `KeyError` en el criterio JSON y campo de aceptación nulo; corregidos. `gate-decision-nvidia64e.json`: criterios 1, 2, 4 pasan; 3 falla (−4,3 pp).
+4. ~~Ganador~~ **NVIDIA64** (Minima64 en la misma matriz: 8/16, −5,8 pp, 4 truncados). La muestra LRU de 6 celdas había sobreestimado a Minima.
+5. **Decisión pendiente del usuario antes de Fase 2:** el criterio 3 (±3 pp de aceptación) lo falla el mejor donante en dos corridas independientes sin coste en calidad ni tok/s. Opciones: (a) relajar a ±5 pp o sustituir por «decode ≥ control −5%» y promover NVIDIA64 a Fase 2; (b) mantener el criterio y cerrar la línea NVFP4-MLP (el prefill se buscaría entonces sólo con FP8 PRIMS, −31% medido en Q=8192). No hay palanca conocida para recuperar la aceptación: el drafter MTP es EXL3 y fijo.
 
 Comando del oráculo:
 
