@@ -11,7 +11,7 @@ Mejorar Qwasar (Qwen 3.8 27B, RTX 5090, 32 GB, MTP6, K8/V4, 256K) sin sustituir 
 | Fase | Qué | Estado |
 |---|---|---|
 | 0 | Puerta de calidad ampliada + baseline EXL3 | **Congelada.** Control 11/16 código, JSON 2/2, pico 24,79 GiB. |
-| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Oráculo pasado** (`nvidia-check7`). A/B pendiente. |
+| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Adaptador corregido** (faltaba invertir `input_scale`; el A/B `nvidia64b` era ruido en 19/19 con el oráculo en verde). Oráculo de 4 puertas pasado (`nvidia-check10`). A/B relanzado como `candidate-nvidia64d`. Ver [donante](2026-09-10-nvidia-donor.md). |
 | 2 | Ganador de Fase 1 + FP8 PRIMS (P×256) + Attention64 + K8/V4 + MTP6 → producción | No empezada. Esperado (medido en híbrido previo): TTFT 258K ~132→~69 s no se reclama hasta medirlo otra vez sobre el ganador. |
 | 3 | Decode: XQA + KV NVFP4 en target, resolviendo antes el runtime de cola FP16 2K | No empezada. Bloqueo conocido: XQA local no expone LSE; el prototipo SGLang anterior tuvo acceso ilegal. |
 | 4 | Cabeza MTP 64K (la memoria la paga Fase 3). Métrica: tiempo por token aceptado | No empezada. |
@@ -50,12 +50,10 @@ El error final es de nombres, no de GPU: el artefacto EXL3 **no guarda** `.weigh
 
 ## Próximos pasos concretos (en este orden)
 
-1. **Oráculo de dos puertas** (`nvidia_linear_check.py`), vía `managed.py`:
-   - **Puerta A (kernel/convención):** unpack ModelOpt multiplicativo vs `NativeLinear` con global invertido, W4A4, umbral RMS 0,003. `qg10-nvchk4` ya midió A=0,0 en `gate_proj` M=1 — la inversión es correcta. Falta la matriz completa de 12×4.
-   - **Puerta B (packing):** coseno en espacio de pesos vs Minima (todas las capas) y Unsloth (sólo MLP 0–55; 56–63 no están empaquetados). Umbral > 0,95. Layer 0 `gate_proj` en CPU: NVIDIA vs Minima **0,993**, vs Unsloth **0,988**. L2 de pesos ~12–15% (calibraciones distintas, no un bug de kernel). El bound del 5% contra EXL3 BF16 era inviable: EXL3 no tiene `.weight` y el L2 entre donantes NVFP4 ya es ~12%.
-2. Si ambas puertas pasan: A/B **NVIDIA-MLP64 vs Minima64** sobre `prompts.json` congelado. FP8 PRIMS y Attention64 apagados. Los MLP están muy cerca en espacio de pesos; el A/B sigue siendo la decisión de calidad e2e.
-3. Calificar con `graders.py`, decidir con `aggregate.py` contra el baseline 11/16.
-4. El ganador entra a Fase 2.
+1. ~~Oráculo de dos puertas~~ **Hecho, y ampliado a cuatro** (18:00). Las puertas A/B pasaron con un adaptador que dejaba `input_scale` sin invertir; el A/B `candidate-nvidia64b` salió ruido en 19/19 celdas. Lección: un oráculo que cuantiza la referencia con los mismos globales que el kernel no detecta convenciones erradas; hace falta una referencia con activaciones sin cuantizar (Puerta C), una ida y vuelta de activaciones (Puerta D) y un brazo rojo que reproduzca el bug conocido. `nvidia-check10`: A 48/48, B 12/12, C 48/48 (máx 0,098), D 48/48 (máx 0,096), rojo 8/8 = 1,0.
+2. **En curso:** A/B **NVIDIA-MLP64** (`candidate-nvidia64d`) sobre `prompts.json` congelado, FP8 PRIMS y Attention64 apagados. Antes de calificar, inspeccionar las completions a ojo: el runner no detecta ruido por sí solo.
+3. Calificar con `graders.py`, decidir con `aggregate.py` contra el baseline 11/16 (`--control control,control-ttl2`).
+4. El ganador entra a Fase 2. Si NVIDIA no supera 11/16, Minima64 (4/6 medido) es el candidato por defecto.
 
 Comando del oráculo:
 
