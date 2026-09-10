@@ -29,6 +29,29 @@ Corridas intermedias: `nvchk8` (contraste rojo asertado en `down_proj`, falso po
 
 Los tensores pasan en los oráculos; el A/B `candidate-nvidia64b` queda invalidado y se relanza como `candidate-nvidia64d` con el adaptador corregido. El intento `candidate-nvidia64c` se abortó por una interrupción del host antes de la primera muestra.
 
+## A/B `candidate-nvidia64d` (adaptador corregido, MLP eager) — 19/19 coherentes
+
+Matriz congelada, MTP6, K8/V4, Flash/8192, sampler recomendado, FP8 PRIMS y Attention64 apagados. Control: `control` + `control-ttl2`. Decisión con `aggregate.py` (que nunca había corrido: tenía un `KeyError` en el criterio JSON y buscaba `speculative_acceptance_rate`, nulo en ambos brazos; ahora usa `draft_acceptance`). `gate-decision-nvidia64d.json`:
+
+| Criterio | Control EXL3 | NVIDIA64 | Puerta |
+|---|---:|---:|---|
+| Código (16 celdas) | 11/16 | 11/16 | pasa (≥) |
+| JSON | 2/2 | 2/2 | pasa |
+| Aceptación MTP, mediana código | 0,735 | 0,701 (−3,48 pp) | **falla por 0,48 pp** |
+| Pico asignado | 24,79 GiB | 23,80 GiB (−0,99) | pasa |
+
+Fallos por celda: control `bucket` ×3 (dos tests generados con expectativa errónea, un truncado) y `ttl` ×2 (`NameError` por `unittest` sin importar, una expectativa errónea); candidato `bucket` ×4 (tres expectativas erróneas con oráculo 7/7, un truncado a 4.089) y `ttl-131072-1` (una expectativa errónea, oráculo 7/7). Mismo modo de fallo en ambos brazos; el candidato gana `ttl` 3/4 vs 2/4 y pierde `bucket` 0/4 vs 1/4.
+
+Velocidad (medianas por contexto):
+
+| Contexto | TTFT control | TTFT NVIDIA64 | Δ | Decode control | Decode NVIDIA64 | Δ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4K (warmup) | 2,68 s | 1,28 s | −52% | 242 | 200 | −17% |
+| 32K | 11,06 s | 6,54 s | **−41%** | 195,1 | 162,8 | −17% |
+| 131K | 68,98 s | 51,80 s | **−25%** | 143,1 | 138,5 | −3% |
+
+**Confusor:** `candidate_runner.py` no llamaba `graph_selected_mlps()`, que los probes Minima/híbrido sí usaban (grafos CUDA por MLP para Q≤7). Los 192 MLP corrieron eager en cada verify: ~400 lanzamientos extra desde Python por forward, que pesan más cuanto más corto es el contexto (−17% a 4K/32K, −3% a 131K). La caída de aceptación (−3,5 pp) no puede explicarse por grafos (misma aritmética); es ruido de trayectoria o efecto real del donante, y se decide con la repetición. El runner ahora captura grafos por defecto (`--no-graph-mlp` para reproducir `64d`) y registra `mlp_graphs` y `graphs.json`. Repetición: `candidate-nvidia64e`.
+
 ## Hallazgo: las convenciones de escalas de NVIDIA y Unsloth son inversas
 
 Medido directamente en `model.language_model.layers.0.mlp.gate_proj` (misma matriz lógica en ambos checkpoints):
