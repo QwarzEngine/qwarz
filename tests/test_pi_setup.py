@@ -29,7 +29,22 @@ def test_preserves_other_providers_and_makes_exact_backup(tmp_path):
     assert output["custom"] is True
     assert output["providers"]["qwasar"]["api"] == "openai-completions"
     assert output["providers"]["qwasar"]["compat"]["thinkingFormat"] == "qwen-chat-template"
+    assert output["providers"]["qwasar"]["compat"]["supportsReasoningEffort"] is True
+    assert output["providers"]["qwasar"]["models"][0]["thinkingLevelMap"]["xhigh"] == "xhigh"
     assert installer().configure(target) is None
+
+
+def test_owned_qwasar_provider_is_updated_in_place(tmp_path):
+    target = tmp_path / "models.json"
+    target.write_text(json.dumps({"providers": {"qwasar": {
+        "baseUrl": "http://127.0.0.1:8800/v1", "api": "openai-completions",
+        "compat": {"supportsReasoningEffort": False, "thinkingFormat": "qwen-chat-template"},
+        "models": [{"id": "qwasar-qwen38-27b"}]}}}))
+    backup = installer().configure(target)
+    assert backup is not None
+    provider = json.loads(target.read_text())["providers"]["qwasar"]
+    assert provider["compat"]["supportsReasoningEffort"] is True
+    assert provider["models"][0]["thinkingLevelMap"]["high"] == "xhigh"
 
 
 def test_conflicting_or_invalid_config_is_never_overwritten(tmp_path):

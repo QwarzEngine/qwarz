@@ -9,15 +9,18 @@ como root ni una aplicación de inicio del escritorio.
 
 - RTX 5090, GPU 0; `CUDA_VISIBLE_DEVICES=0`.
 - `/home/rekeyea/models/Qwen3.8-27B-EXL3-5.0bpw`.
-- EXL3 5 bpw nominal, cabeza a 6 bits, MTP a 4 bits.
-- MTP con 4 tokens draft y caché K8/V4, fijados por el backend v1.
+- EXL3 5 bpw nominal, cabeza a 6 bits, MTP a 4 bits; 192 MLP sustituidas por
+  el donante NVIDIA NVFP4 (`nvidia64`, rev `dbb8f445…`).
+- MTP con 6 tokens draft y caché K8/V4, fijados por el backend v1.
 - Ventana nativa de 262.144 posiciones, fijada por el servicio v1.
-- Perfil Flash de prefill, bloques de 8.192 tokens.
+- Perfil `flash`: Flash/8192, FP8 PRIMS (P×256, Q≥8192) y Attention64.
 - Endpoint local `http://127.0.0.1:8800/v1`, modelo `qwasar-qwen38-27b`.
 - La misma base durable `state/qwasar.db`; las sesiones no se borran al parar.
 
 El arranque comprueba la ocupación de GPU 0. No mata otros procesos para hacer
-sitio. El worker verifica el hash completo del artefacto antes de cargar CUDA.
+sitio. El worker verifica el hash completo del artefacto EXL3 y el tamaño de
+los shards NVIDIA antes de cargar CUDA. El workspace JIT de FlashInfer es
+`results/20260910-quality-gate/phase2-workspace`.
 El servicio permanece en `activating` hasta que su propio worker publica
 `ready`; no basta con que otro proceso responda HTTP 200 en el puerto.
 
@@ -113,8 +116,10 @@ trabajo. La habilitación para boot se comprueba sin reiniciar toda la máquina.
 El 2026-09-06 se verificaron la sintaxis con `systemd-analyze --user verify`,
 290 tests Python, la primera carga bajo systemd y un reinicio gestionado. El
 worker anterior desapareció y el nuevo respondió `BOOT_READY` con el perfil
-5 bpw + MTP + K8/V4, Flash y 262.144 posiciones. La unidad quedó `enabled` y
-`active/running`, con `Linger=yes`; SGLang en GPU 1 conservó su proceso.
+entonces vigente (5 bpw + MTP + K8/V4, Flash y 262.144 posiciones). El 2026-09-11
+`flash` pasó a NVIDIA64 + PRIMS + Attention64; `TimeoutStartSec` es 600 s.
+La unidad quedó `enabled` y `active/running`, con `Linger=yes`; SGLang en GPU 1
+conservó su proceso.
 No se reinició la máquina ni se simuló un fallo fatal del supervisor.
 
 Evidencia local: `results/systemd-install/before.json` y

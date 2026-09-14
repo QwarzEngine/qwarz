@@ -1,0 +1,13 @@
+[
+  {
+    "model": "qwasar-qwen38-27b",
+    "id": "custom:Qwasar-Qwen3.8-27B-[5090]-0",
+    "index": 0,
+    "baseUrl": "http://127.0.0.1:8800/v1",
+    "apiKey": "qwasar-local",
+    "displayName": "Qwasar Qwen3.8 27B · 5bpw · MTP",
+    "maxOutputTokens": 32768,
+    "noImageSupport": false,
+    "provider": "generic-chat-completion-api"
+  }
+]

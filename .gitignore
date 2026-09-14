@@ -13,3 +13,7 @@ benchmarks/baselines/
 .vscode/
 target/
 state/
+.env
+.env.*
+*.pem
+credentials.json

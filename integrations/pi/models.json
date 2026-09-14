@@ -7,7 +7,7 @@
       "compat": {
         "supportsStore": false,
         "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
+        "supportsReasoningEffort": true,
         "supportsStrictMode": false,
         "supportsLongCacheRetention": false,
         "maxTokensField": "max_tokens",
@@ -17,7 +17,16 @@
         "id": "qwasar-qwen38-27b",
         "name": "Qwasar Qwen3.8 27B · 5bpw · MTP",
         "reasoning": true,
-        "input": ["text"],
+        "thinkingLevelMap": {
+          "off": "off",
+          "minimal": "low",
+          "low": "low",
+          "medium": "medium",
+          "high": "xhigh",
+          "xhigh": "xhigh",
+          "max": "xhigh"
+        },
+        "input": ["text", "image"],
         "contextWindow": 262144,
         "maxTokens": 32768,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}

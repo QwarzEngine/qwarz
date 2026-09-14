@@ -51,9 +51,7 @@ async fn config(State(app): State<App>) -> Json<Value> {
     Json(app.worker.health())
 }
 async fn models() -> Json<Value> {
-    Json(
-        json!({"object":"list","data":[{"id":api::MODEL,"object":"model","owned_by":"qwasar","context_window":262144}]}),
-    )
+    Json(api::models_payload())
 }
 fn error(status: u16, code: &str, message: &str) -> Response {
     (
@@ -136,9 +134,17 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         },
         None => None,
     };
-    let request = match api::prepare(&body, responses, explicit_parent.as_ref()) {
+    let mut request = match api::prepare(&body, responses, explicit_parent.as_ref()) {
         Ok(request) => request,
         Err(detail) => return error(400, "invalid_request", &detail),
+    };
+    if let Err(response) = resolve_images(&app, &mut request) {
+        return response;
+    }
+    let body = if request.get("images").is_some() {
+        api::redact_images(&body)
+    } else {
+        body
     };
     let idempotency = headers
         .get("idempotency-key")
@@ -410,6 +416,42 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         Ok(terminal) => terminal_error(&terminal),
         Err(_) => error(503, "worker_lost", "generation task ended"),
     }
+}
+
+/// Persists inline image bytes and fills hash-only references from the store so
+/// the worker request is self-contained. Unknown hashes are rejected before
+/// any generation is dispatched.
+fn resolve_images(app: &App, request: &mut Value) -> Result<(), Response> {
+    use base64::Engine;
+    let Some(images) = request.get_mut("images").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let standard = base64::engine::general_purpose::STANDARD;
+    for (sha256, image) in images.iter_mut() {
+        let media_type = image["media_type"].as_str().unwrap_or("").to_string();
+        match image["data"].as_str() {
+            Some(data) => {
+                let bytes = standard
+                    .decode(data)
+                    .map_err(|_| error(400, "invalid_request", "image data is not valid base64"))?;
+                app.store
+                    .put_image(sha256, &media_type, &bytes)
+                    .map_err(|detail| error(500, "storage_error", &detail))?;
+            }
+            None => {
+                let (stored_type, bytes) = app
+                    .store
+                    .image(sha256)
+                    .map_err(|detail| error(500, "storage_error", &detail))?
+                    .ok_or_else(|| {
+                        error(400, "unknown_image", &format!("image {sha256} is not stored; resend it inline"))
+                    })?;
+                image["media_type"] = json!(stored_type);
+                image["data"] = json!(standard.encode(bytes));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn replay_result(stored: Value, responses: bool, streaming: bool, include_usage: bool) -> Response {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Qwasar Qwen3.8-27B EXL3 5bpw + MTP + K8/V4 (RTX 5090)
+Description=Qwasar Qwen3.8-27B EXL3 + NVIDIA64 + Flash/PRIMS + MTP6 + K8/V4 (RTX 5090)
 StartLimitIntervalSec=0
 
 [Service]
@@ -16,7 +16,7 @@ ExecStart=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py serve --pre
 ExecStartPost=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py wait-ready --pid ${MAINPID}
 Restart=on-failure
 RestartSec=15
-TimeoutStartSec=360
+TimeoutStartSec=600
 TimeoutStopSec=45
 KillMode=mixed
 UMask=0077

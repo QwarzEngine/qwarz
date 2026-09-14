@@ -35,8 +35,10 @@ Un candidato **pasa** si y solo si, contra el control EXL3 medido en esta misma 
 
 1. **Código: candidato ≥ control** en entregas completas (formato válido + suite generada con ≥8 tests descubiertos y sin fallos + oráculo independiente 7/7), sobre las 16 celdas. Truncados y fallos permanecen en el resultado; no se repara código.
 2. **JSON: 2/2** en ambos brazos.
-3. **Aceptación MTP**: mediana de `speculative_acceptance_rate` dentro de ±3 puntos porcentuales del control en las celdas de código parejas.
+3. **Aceptación MTP**: mediana de `draft_acceptance` (antes se pedía `speculative_acceptance_rate`) dentro de ±5 puntos porcentuales del control en las celdas de código parejas.
 4. **Memoria**: pico asignado ≤ control + 0,5 GiB.
+
+**Enmienda 2026-09-11:** el criterio 3 se fijó en ±3 pp *antes* de medir. NVIDIA64 midió −4,3 pp en dos corridas (`64d` −3,5; `64e` −4,3) sin coste de código, JSON ni tok/s. El usuario relajó la banda a **±5 pp** y promovió NVIDIA64 a Fase 2. Los JSON históricos `gate-decision-*.json` conservan el veredicto ±3 (`acceptance_within_3pp`). El umbral vivo lo aplica `aggregate.py --acceptance-pp` (por defecto 5); las decisiones nuevas son `gate-decision-*-pp5.json`.
 
 Un empate agregado no demuestra equivalencia: se reportan los fallos concretos por celda en ambos brazos. La decisión la aplica `results/20260910-quality-gate/aggregate.py` sobre las calificaciones y muestras crudas; el umbral de aceptación es simétrico porque una subida inexplicable también indica cambio de comportamiento.
 

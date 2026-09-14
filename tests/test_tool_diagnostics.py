@@ -13,7 +13,9 @@ TOOLS = [{"type": "function", "function": {"name": "ask_user_question", "paramet
     "type": "object", "properties": {"question": {"type": "string"}, "options": {
         "type": "array", "items": {"type": "string"}}}, "required": ["question"]}}}]
 RAW = ('<tool_call><function=ask_user_question><parameter=question>Choose</parameter>'
-       '<parameter=options>[{"label":"PRIVATE_VALUE"}]</parameter></function></tool_call>')
+       '<parameter=options>[{"secret":"PRIVATE_VALUE","other":true}]</parameter></function></tool_call>')
+COERCED = ('<tool_call><function=ask_user_question><parameter=question>Choose</parameter>'
+           '<parameter=options>[{"label":"Go ahead"}]</parameter></function></tool_call>')
 
 
 def run_invalid(directory, raw=RAW):
@@ -47,14 +49,15 @@ def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path
     directory = tmp_path / 'diagnostics'
     engine, backend, events = run_invalid(directory)
     terminal = events[-1]
-    assert terminal['status'] == 'failed'
+    assert terminal['status'] == 'incomplete'
     assert terminal['snapshot'] is None
+    assert terminal['error'] is None
     assert terminal['message']['tool_calls'] == []
     assert 'PRIVATE_VALUE' not in json.dumps(events)
     record = json.loads(next(directory.glob('*.json')).read_text())
     assert record['raw_tool_calls'] == RAW
     assert record['tool_schemas']['ask_user_question'] == TOOLS[0]['function']['parameters']
-    assert record['parsed_arguments']['options'] == [{'label': 'PRIVATE_VALUE'}]
+    assert record['parsed_arguments']['options'] == [{'secret': 'PRIVATE_VALUE', 'other': True}]
     assert record['validation']['path'] == ['options', 0]
     assert record['stage'] == 'schema_validation'
     assert record['response_id'] == 'resp_test'
@@ -62,10 +65,9 @@ def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path
     assert 'PROMPT_SECRET' not in json.dumps(record)
     assert 'Public prefix.' not in json.dumps(record)
     assert len(record['parser_sha256']) == 64
-    assert terminal['error']['diagnostic_id'] == record['diagnostic_id']
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
     assert stat.S_IMODE(next(directory.glob('*.json')).stat().st_mode) == 0o600
-    assert backend.resets == 1
+    assert backend.resets == 0
     backend.start = FakeBackend.start.__get__(backend)
     followup = list(engine.generate('resp_next', {'messages': [{'role': 'user', 'content': 'hello'}]},
                                    None, threading.Event()))
@@ -76,8 +78,8 @@ def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path
 def test_capture_failure_does_not_mask_original_error(tmp_path):
     with patch('qwasar_runtime.diagnostics.save_diagnostic', side_effect=OSError('PRIVATE_PATH')):
         _, _, events = run_invalid(tmp_path)
-    assert events[-1]['error']['message'] == 'expected string'
-    assert events[-1]['error']['diagnostic_status'] == 'unavailable'
+    assert events[-1]['status'] == 'incomplete'
+    assert events[-1]['error'] is None
     assert 'PRIVATE_PATH' not in json.dumps(events)
 
 
@@ -86,7 +88,22 @@ def test_malformed_native_call_is_captured(tmp_path):
     record = json.loads(next(tmp_path.glob('*.json')).read_text())
     assert record['stage'] == 'native_parse'
     assert record['raw_tool_calls'] == '<tool_call>broken</tool_call>'
-    assert events[-1]['status'] == 'failed'
+    assert events[-1]['status'] == 'incomplete'
+
+
+def test_unclosed_native_call_is_incomplete(tmp_path):
+    engine, backend, events = run_invalid(
+        tmp_path, '<tool_call><function=ask_user_question><parameter=question>Choose')
+    terminal = events[-1]
+    assert terminal['status'] == 'incomplete'
+    assert terminal['error'] is None
+    assert terminal['snapshot'] is None
+    assert terminal['message']['tool_calls'] == []
+    assert backend.resets == 0
+    record = json.loads(next(tmp_path.glob('*.json')).read_text())
+    assert record['stage'] == 'incomplete_native_parse'
+    assert 'Choose' in record['raw_tool_calls']
+    assert 'PROMPT_SECRET' not in json.dumps(events)
 
 
 def test_writer_limits_size_and_retention(tmp_path):
@@ -142,9 +159,21 @@ def test_replay_reports_changed_parser_and_argument_evidence(tmp_path):
     assert report['parsed_arguments_match'] is False
 
 
+def test_label_options_are_coerced_instead_of_failing(tmp_path):
+    _, backend, events = run_invalid(tmp_path, COERCED)
+    terminal = events[-1]
+    assert terminal['status'] == 'completed'
+    assert terminal['error'] is None
+    arguments = json.loads(terminal['message']['tool_calls'][0]['function']['arguments'])
+    assert arguments['options'] == ['Go ahead']
+    assert backend.resets == 0
+    assert not list(tmp_path.glob('*.json'))
+
+
 def test_capture_can_be_disabled():
     _, _, events = run_invalid(None)
-    assert 'diagnostic_id' not in events[-1]['error']
+    assert events[-1]['error'] is None
+    assert events[-1]['status'] == 'incomplete'
 
 
 def test_malformed_second_call_does_not_publish_first_call(tmp_path):

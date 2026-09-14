@@ -15,8 +15,11 @@ python3 scripts/qwasar.py status
 
 Standalone startup builds the release executable using the locked Cargo
 dependencies; the installed systemd unit uses the already-built release binary.
-The service verifies the complete frozen model artifact before
-loading. Allow several minutes for compilation, hashing and GPU initialization.
+The service verifies the complete frozen EXL3 artifact and the NVIDIA MLP
+donor shard sizes before loading. Allow several minutes for hashing, donor
+substitution and GPU initialization. After this promotion, committed token
+snapshots from the previous EXL3-only identity are not reused: those turns
+re-render from text until new snapshots accumulate.
 The launcher refuses to take over another substantial compute process on GPU 0;
 it does not stop other inference services. GPU 1 is never selected.
 
@@ -30,7 +33,8 @@ cd /path/to/your/project
 Alternatively select provider `qwasar`, model `qwasar-qwen38-27b` in Pi.
 The wrapper pins the tested Pi 0.84.4 binary without invoking the mise updater;
 set `PI_BIN` to override it. Additional Pi arguments are passed through,
-including `--continue` and `--thinking off`. Pi owns its session files; the
+including `--continue` and `--thinking off`. The wrapper starts Qwasar at
+`--thinking xhigh`. Pi owns its session files; the
 server matches replayed assistant history to its durable exact token segments.
 
 The installer adds only the Qwasar provider to `~/.pi/agent/models.json`.
@@ -55,10 +59,12 @@ python3 scripts/qwasar.py start --prefill baseline
 ```
 
 `start` keeps an already-running instance; changing profile requires `stop`
-then `start`. The selected Flash path uses 8192-token prefill chunks; `baseline`
-is the reference fallback. Both use the same pinned EXL3 5 bpw weights, MTP
-drafting and K8/V4 cache. Alternative weights intentionally fail the artifact
-hash check: switching quantization is not an unvalidated path substitution.
+then `start`. The selected Flash path is NVIDIA64 + Flash/8192 + FP8 PRIMS
+(Q≥8192) + Attention64. `baseline` is the EXL3 Triton fallback. Both keep the
+pinned EXL3 5 bpw artifact, MTP drafting and K8/V4 cache; Flash additionally
+substitutes the 192 pinned NVIDIA NVFP4 MLP matrices. Alternative EXL3 weights
+fail the artifact hash check. NVIDIA shards are size-checked against the
+recorded pin, not rehashed on every start.
 
 Logs, PID identity and the SQLite WAL database live under ignored `state/`.
 With systemd, process ownership belongs to the unit and new logs go to
@@ -89,8 +95,35 @@ Do not expose this endpoint through an unauthenticated proxy.
 
 Only one request generates at a time. Concurrent requests receive 409 rather
 than waiting in an invisible queue. Unsupported controls are rejected rather
-than silently ignored. Images, audio, structured-output constraints and general
+than silently ignored. Audio, video, structured-output constraints and general
 Responses API feature parity are not part of v1.
+
+## Images
+
+Qwen3.8-27B is natively multimodal and the pinned EXL3 artifact ships its BF16
+vision tower, so the worker loads it next to the text model (about 0.9 GB of
+VRAM). User messages may carry inline images as Chat Completions `image_url`
+parts or Responses `input_image` parts. Only base64 **data URLs** are accepted
+(`data:image/png;base64,...`); remote URLs are never fetched. Supported types:
+PNG, JPEG, WebP, GIF. Limits: 8 MiB per image, 16 images per request. Images in
+`system`, `assistant` or `tool` messages are rejected.
+
+Each image costs roughly `pixels / 1024` prompt tokens after resizing to at
+most `QWASAR_MAX_IMAGE_PIXELS` (default 2,359,296; a 1920×1080 frame is not
+downscaled and takes about 2,040 tokens). Those tokens count toward the native
+262,144-position budget and appear in `usage.prompt_tokens`.
+
+Image bytes are stored once in SQLite by SHA-256; durable snapshots and
+`history_key` only reference the hash, so a Responses `previous_response_id`
+turn does not need to resend earlier images. Chat Completions clients resend
+the full conversation anyway. The worker keeps the last
+`QWASAR_IMAGE_CACHE` (default 32) embeddings in memory, which is what keeps
+prefix reuse working across turns that contain the same image; after a worker
+restart the first turn re-embeds and re-prefills. Measured sample: a 1280×720
+PNG cost 880 prompt tokens, cold first content 1.19 s, and the follow-up turn
+reused 768 cached tokens with 108 ms to first content. Vision quality on the
+5 bpw + NVFP4 MLP stack has not been benchmarked; see
+`docs/superpowers/plans/2026-09-14-vision.md`.
 
 Tool schemas support `patternProperties`, including nested argument maps used
 by Pi's MCPorter extension. All matching patterns and explicit properties are
@@ -100,10 +133,25 @@ validated; `additionalProperties` applies only to unmatched names, following the
 Pi uses `openai-completions` (the Chat Completions API), Qwen template thinking,
 262144 total positions and a 32768-token output allowance (the current API
 maximum). This allowance includes reasoning and generated tool arguments.
-Thinking `off` disables
-reasoning; enabled Pi thinking modes select the worker's medium policy. Direct
-API requests can select the exposed thinking controls. Generated tool arguments
-are buffered until a complete, schema-valid call is available; ordinary text and
+Thinking `off` disables reasoning. Enabled efforts (`low`, `medium`, `xhigh`)
+keep thinking on; `xhigh` stays available. The Qwasar Pi provider sends `reasoning_effort` (`xhigh` by default in
+`pi_qwasar.sh`; `high`/`max` map to `xhigh`). A request that only sets
+`chat_template_kwargs.enable_thinking=true` still selects **medium**. Several live
+sessions used `max_tokens=8192` with thinking on; without a cap that budget was spent
+almost entirely on reasoning. The worker now caps reasoning so a content reserve
+remains inside `max_tokens` (1024 tokens, or half the budget when the request is
+smaller). Default caps are 1024 / 2048 / 8192 for low / medium / `xhigh`.
+`reasoning_budget_tokens` overrides the cap; `0` disables it. A cap stop, or a
+model that emits `im_end` before `</think>`, injects the native close tokens and
+continues the same request without resetting GPU cache.
+After a tool result, the tools header stays in the cached prefix. The worker
+appends a suffix-only hint: answer if the results are enough, otherwise call the
+next tool. It does not forbid the normal tool loop. Prefer `edit`/`write` over
+rewriting a file with bash. A native `<tool_call>` cut off mid-stream, or a
+schema-invalid call that cannot be coerced, is `incomplete` rather than a failed
+generation that wipes GPU cache. Object-shaped `ask_user_question` options
+(`{label}` / `{title}`) are accepted as strings. Generated tool arguments are
+buffered until a complete, schema-valid call is available; ordinary text and
 reasoning stream incrementally. Pi executes tools with your local permissions.
 
 Pi's own default automatic compaction reserves 16384 tokens, so it normally
@@ -129,8 +177,10 @@ speculation space inside the native context instead of silently truncating it.
 
 Warm continuation and cold ingestion are different workloads. Prior direct
 probes reached roughly 85 tokens/s near 256K and warm TTFT below one second for
-small appended turns, but cold 257K prefill took about 132 seconds with Flash.
-These are workload-specific screening results, not a blanket HTTP or Pi SLA.
+small appended turns. Cold near-256K prefill on the promoted stack was about
+67 seconds (133 seconds on the previous EXL3+Flash control). See the
+[phase-2 gate](benchmarks/2026-09-11-phase2-results.md). These are
+workload-specific screening results, not a blanket HTTP or Pi SLA.
 Thinking, long tool outputs, cache eviction, restart and Pi compaction can all
 increase visible response time. A 32768-token output budget is not a promise to
 finish within 30 seconds. See the

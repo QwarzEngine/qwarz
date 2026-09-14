@@ -8,6 +8,14 @@ import uuid
 from .parsing import canonical, message_key, parse_json
 
 
+CONTINUE_OR_ANSWER = (
+    "If the tool results already answer the user, reply without calling tools. "
+    "If you still need to read, edit, or run a command, call that tool.")
+PREFER_EDIT = (
+    "When changing an existing file, call the edit or write tool instead of rewriting the file with bash.")
+REASONING_CLOSE = "</think>\n\n"
+
+
 def encode(tokenizer, text, literal=False):
     if literal:
         backend = tokenizer.tokenizer
@@ -30,7 +38,22 @@ class Prompt:
     header: str
 
 
-def render(tokenizer, messages, tools, thinking, tool_choice, segments):
+def turn_instructions(messages, tools, tool_choice):
+    instructions = []
+    last_role = messages[-1]["role"] if messages else None
+    names = {tool["function"]["name"] for tool in tools}
+    if last_role == "tool" and tool_choice == "auto":
+        instructions.append(CONTINUE_OR_ANSWER)
+    if last_role == "user" and tool_choice == "auto" and "bash" in names and names & {"edit", "write"}:
+        instructions.append(PREFER_EDIT)
+    return instructions
+
+
+def render(tokenizer, messages, tools, thinking, tool_choice, segments, image_tokens=None):
+    """Renders the exact prompt tape. ``image_tokens`` maps image sha256 to the
+    literal token IDs of its embedding (vision start/end included); each image
+    part becomes a placeholder resolved to those IDs, never re-tokenized."""
+    image_tokens = image_tokens or {}
     replacements = {}
     prefix = "QWASAR_" + uuid.uuid4().hex + "_"
 
@@ -52,7 +75,19 @@ def render(tokenizer, messages, tools, thinking, tool_choice, segments):
             message.update(content=marker, reasoning_content="", tool_calls=[])
             frame_markers.append(marker)
         else:
-            for field in ("content", "reasoning_content"):
+            fields = ["content", "reasoning_content"]
+            if isinstance(message.get("content"), list):
+                pieces = []
+                for part in message["content"]:
+                    if part["type"] == "image":
+                        if part["sha256"] not in image_tokens:
+                            raise ValueError(f"image {part['sha256']} has no embedding")
+                        pieces.append(placeholder("", image_tokens[part["sha256"]]))
+                    elif part["text"]:
+                        pieces.append(placeholder(part["text"]))
+                message["content"] = "".join(pieces)
+                fields.remove("content")
+            for field in fields:
                 if message.get(field):
                     message[field] = placeholder(message[field])
             for call in message.get("tool_calls", []):
@@ -72,6 +107,8 @@ def render(tokenizer, messages, tools, thinking, tool_choice, segments):
             protected[0]["content"] += "\n\n" + instruction
         else:
             protected.insert(0, {"role": "system", "content": instruction})
+    for text in turn_instructions(messages, tools, tool_choice):
+        protected.append({"role": "user", "content": placeholder(text)})
     rendered = tokenizer.hf_render_chat_template(
         protected, tools=protected_tools, add_generation_prompt=True,
         enable_thinking=thinking != "off", reasoning_effort=thinking if thinking != "off" else "medium",

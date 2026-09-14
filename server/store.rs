@@ -13,7 +13,9 @@ impl Store {
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS responses(id TEXT PRIMARY KEY, status TEXT NOT NULL, request TEXT NOT NULL,
             result TEXT NOT NULL, snapshot TEXT, history_key TEXT, idempotency TEXT UNIQUE);
-            CREATE INDEX IF NOT EXISTS response_history ON responses(history_key);").map_err(|error|error.to_string())?;
+            CREATE INDEX IF NOT EXISTS response_history ON responses(history_key);
+            CREATE TABLE IF NOT EXISTS images(sha256 TEXT PRIMARY KEY, media_type TEXT NOT NULL, bytes BLOB NOT NULL,
+            created INTEGER NOT NULL);").map_err(|error|error.to_string())?;
         let mut statement = connection
             .prepare("SELECT id FROM responses WHERE status='in_progress'")
             .map_err(|error| error.to_string())?;
@@ -135,6 +137,33 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Stores image bytes keyed by their SHA-256 (content-addressed, idempotent).
+    pub fn put_image(&self, sha256: &str, media_type: &str, bytes: &[u8]) -> Result<(), String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO images(sha256,media_type,bytes,created) VALUES(?1,?2,?3,?4)",
+                params![sha256, media_type, bytes, api::now()],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Returns `(media_type, bytes)` for a stored image, if any.
+    pub fn image(&self, sha256: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+        self.connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT media_type,bytes FROM images WHERE sha256=?1",
+                [sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
 
     pub fn idempotent(&self, key: &str) -> Result<Option<(String, Value, Value)>, String> {

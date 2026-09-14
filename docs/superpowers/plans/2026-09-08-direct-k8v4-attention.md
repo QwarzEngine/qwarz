@@ -4,6 +4,8 @@
 
 **Execution status (2026-09-08):** investigación cerrada con rechazo medido: mejor Q7 1,324 ms frente a 0,813 ms. Tareas 1–3 completadas; tarea 4 produjo un rechazo. Tareas 5 y métricas integradas de 6 no aplican porque no pasó el gate de velocidad. Informe: `results/20260908-direct-k8v4/report.md`. Los casilleros pendientes conservan explícitamente trabajo no ejecutado; no implican una promoción pendiente.
 
+**Seguimiento (2026-09-11):** no reabrir este plan. La segunda generación (portar Attention64 al ABI, no otro WMMA) está en [`2026-09-11-qwasar-attention-kernel.md`](2026-09-11-qwasar-attention-kernel.md).
+
 **Goal:** Evaluar e integrar únicamente si gana una atención especializada que lea K8/V4 sin espejo completo.
 
 **Architecture:** Lector por bloques en el dominio Hadamard, cálculo FP16 y acumulación/softmax FP32. Mantener append, paginación y MTP6; validar primero el lector, después el kernel y finalmente el slot del bloque fusionado. El backend actual es referencia y fallback por forma.

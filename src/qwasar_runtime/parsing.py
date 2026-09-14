@@ -8,6 +8,9 @@ import re
 
 
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,127}\Z")
+TOOL_CALL = re.compile(
+    r"<tool_call>\s*<function=([A-Za-z_][A-Za-z0-9_-]*)>(.*?)</function>\s*</tool_call>", re.S)
+
 
 
 def canonical(value):
@@ -171,6 +174,54 @@ def _validate_value(value, schema, root, path):
             raise ValueError("number outside exclusive limits")
 
 
+TEXT_KEYS = ("title", "label", "text", "value", "question", "name")
+
+
+def _as_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in TEXT_KEYS:
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+    return None
+
+
+def coerce_value(value, schema):
+    if schema is True or not isinstance(schema, dict):
+        return value
+    expected = schema.get("type")
+    types = expected if isinstance(expected, list) else [expected] if expected else []
+    if "string" in types and not isinstance(value, str):
+        text = _as_text(value)
+        if text is not None:
+            value = text
+    if "array" in types and isinstance(value, list):
+        value = [coerce_value(item, schema.get("items", True)) for item in value]
+    if "object" in types and isinstance(value, str):
+        required = [name for name in schema.get("required", []) if name in TEXT_KEYS]
+        if len(required) == 1:
+            value = {required[0]: value}
+    if "object" in types and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        value = {name: coerce_value(item, properties[name]) if name in properties else item
+                 for name, item in value.items()}
+    return value
+
+
+def coerce_arguments(arguments, schema):
+    if not isinstance(arguments, dict) or not isinstance(schema, dict):
+        return arguments
+    coerced = {}
+    for name, value in arguments.items():
+        result = value
+        for candidate in property_schemas(schema, name):
+            result = coerce_value(result, candidate)
+        coerced[name] = result
+    return coerced
+
+
 def validate_tools(tools):
     if not isinstance(tools, list):
         raise ValueError("tools must be an array")
@@ -195,6 +246,51 @@ def validate_tools(tools):
     return functions
 
 
+IMAGE_MEDIA_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def normalize_parts(parts, role):
+    """Returns a plain string for text-only parts, or a list mixing text and
+    canonical image parts ({"type":"image","sha256":…,"media_type":…}).
+    Images are only accepted in user messages."""
+    output = []
+    for part in parts:
+        if not isinstance(part, dict):
+            raise ValueError("message parts must be objects")
+        kind = part.get("type")
+        if kind == "text":
+            if not isinstance(part.get("text"), str):
+                raise ValueError("text part requires text")
+            if output and output[-1]["type"] == "text":
+                output[-1]["text"] += part["text"]
+            else:
+                output.append({"type": "text", "text": part["text"]})
+        elif kind == "image":
+            if role != "user":
+                raise ValueError("images are only supported in user messages")
+            sha256, media_type = part.get("sha256"), part.get("media_type")
+            if not isinstance(sha256, str) or not SHA256_HEX.fullmatch(sha256):
+                raise ValueError("image part requires a lowercase sha256 hex")
+            if media_type not in IMAGE_MEDIA_TYPES:
+                raise ValueError("unsupported image media type")
+            output.append({"type": "image", "sha256": sha256, "media_type": media_type})
+        else:
+            raise ValueError("only text and image message parts are supported")
+    if not any(part["type"] == "image" for part in output):
+        return "".join(part["text"] for part in output)
+    return output
+
+
+def image_parts(messages):
+    """Yields canonical image parts in prompt order."""
+    for message in messages:
+        if isinstance(message.get("content"), list):
+            for part in message["content"]:
+                if part.get("type") == "image":
+                    yield part
+
+
 def validate_messages(messages, tools):
     validate_tools(tools)
     if not isinstance(messages, list) or not messages:
@@ -210,10 +306,8 @@ def validate_messages(messages, tools):
         content = message.get("content")
         content = "" if content is None else content
         if isinstance(content, list):
-            if any(not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str) for part in content):
-                raise ValueError("only text message parts are supported")
-            content = "".join(part["text"] for part in content)
-        if not isinstance(content, str):
+            content = normalize_parts(content, role)
+        if not isinstance(content, (str, list)):
             raise ValueError("message content must be text")
         normalized = {"role": role, "content": content}
         if role == "tool":
@@ -323,6 +417,18 @@ class StreamParser:
             self.content += text
         output.append((self.channel, text))
 
+    def unclosed_tool_xml(self):
+        if not self.in_tools:
+            return False
+        remaining = self.xml.strip()
+        while remaining:
+            match = TOOL_CALL.match(remaining)
+            if match:
+                remaining = remaining[match.end():].strip()
+                continue
+            return remaining.startswith("<tool_call>") and "</tool_call>" not in remaining
+        return False
+
     def finish(self, complete=True):
         if complete and self.channel == "reasoning":
             raise ValueError("generation ended before reasoning closed")
@@ -333,7 +439,7 @@ class StreamParser:
             remaining = self.xml.strip()
             while remaining:
                 self.tool_diagnostic.update(tool=None, parsed_arguments={}, stage="native_parse", call_index=len(calls))
-                match = re.match(r"<tool_call>\s*<function=([A-Za-z_][A-Za-z0-9_-]*)>(.*?)</function>\s*</tool_call>", remaining, re.S)
+                match = TOOL_CALL.match(remaining)
                 if not match:
                     raise ValueError("malformed native tool call")
                 name, parameters = match.group(1, 2)
@@ -365,6 +471,8 @@ class StreamParser:
                                 raise ValueError(f"invalid JSON value for {key}")
                     arguments[key] = value
                     parameters = parameters[parameter.end():]
+                arguments = coerce_arguments(arguments, schema)
+                self.tool_diagnostic["parsed_arguments"] = arguments
                 self.tool_diagnostic["stage"] = "schema_validation"
                 validate_value(arguments, schema)
                 call_id = "call_" + hashlib.sha256(f"{self.response_id}:{len(calls)}".encode()).hexdigest()[:24]

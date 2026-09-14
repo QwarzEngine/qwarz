@@ -1,6 +1,6 @@
 # Qwasar v1: la combinación que usamos y por qué funciona
 
-Actualizado: 2026-09-07.
+Actualizado: 2026-09-11.
 
 ## Resumen
 
@@ -11,12 +11,13 @@ servidores SGLang, vLLM, llama.cpp y ExLlama: el backend elegido es
 
 | Capa | Elección | Aporte |
 | --- | --- | --- |
-| Pesos | Artefacto EXL3 **5 bpw** congelado | Configuración de cuantización seleccionada para esta v1. |
-| Decode | **ExLlamaV3 + MTP**, 6 propuestas fijas | Propone varios tokens y verifica las propuestas con el modelo principal. |
+| Pesos | EXL3 **5 bpw** + **NVIDIA64 NVFP4** en 192 MLP | El artefacto EXL3 sigue pinado; gate/up/down de las 64 capas salen del donante NVIDIA. |
+| Decode | **ExLlamaV3 + MTP6** y **Attention64** | Seis propuestas fijas; decode Triton con `block_n=64`. |
 | Caché | **K8/V4** | Reduce el tamaño de claves y valores para alojar la ventana larga. |
-| Prefill | Ruta **Flash de PyTorch**, bloques de **8.192 tokens** | Acelera el procesamiento de tokens nuevos; se conserva el baseline como alternativa. |
+| Prefill | **Flash/8192** + **FP8 PRIMS** (P×256, Q≥8192) | PRIMS cubre los chunks grandes; el resto sigue en Flash. `baseline` es Triton. |
 | Continuidad | Historial con **IDs exactos** y reutilización del prefijo | Evita volver a procesar el historial completo en cada turno compatible. |
-| Servicio | **Rust + Axum + SQLite WAL** | HTTP, admisión, persistencia, streaming y supervisión del worker. |
+| Visión | Torre **BF16 del propio artefacto** + `MMEmbedding` | Imágenes inline en mensajes de usuario; ~0,9 GB extra; tokens ≈ píxeles/1024. |
+| Servicio | **Rust + Axum + SQLite WAL** | HTTP, admisión, persistencia (incluidas imágenes por hash), streaming y supervisión del worker. |
 | GPU | Worker **Python/ExLlamaV3** en GPU 0 | Un solo propietario del generador y del estado de inferencia. |
 | Cliente | **Pi**, mediante Chat Completions | Interacción, sesiones y ejecución local de herramientas. |
 
@@ -64,9 +65,12 @@ cinco bits. El `config.json` del artefacto declara:
 ```
 
 Por tanto, la configuración nominal es **5 bpw para el modelo principal,
-cabeza a 6 bits y MTP a 4 bits**. No estamos ejecutando el antiguo artefacto de
-3,5 bpw. Cambiar el modelo exige actualizar y validar el pin; no basta con
-apuntar a cualquier carpeta cuyo nombre diga «5 bpw».
+cabeza a 6 bits y MTP a 4 bits**. En `flash`, las 192 matrices MLP
+(gate/up/down de las capas 0–63) se sustituyen por el donante NVIDIA NVFP4
+pinado en `benchmarks/manifests/nvidia-qwen38-27b-nvfp4.json`. No estamos
+ejecutando el antiguo artefacto de 3,5 bpw. Cambiar el modelo o el donante
+exige actualizar y validar el pin; no basta con apuntar a cualquier carpeta
+cuyo nombre diga «5 bpw».
 
 ### 2. Caché K8/V4
 
@@ -143,7 +147,11 @@ siempre la herramienta o los argumentos correctos.
 ## Qué no forma parte de esta v1
 
 - No hay un megakernel monolítico propio ni un runtime nativo C++/CUDA completo.
-- No se seleccionó NVFP4 para los pesos ni para esta configuración de caché.
+- NVFP4 entra sólo en las 192 MLP del donante NVIDIA. GDN, atención, embeddings,
+  `lm_head`, MTP, la torre de visión y la caché K8/V4 siguen en EXL3. XQA / KV
+  NVFP4 no están en producción.
+- Vídeo y URLs remotas de imágenes no se aceptan; la calidad visual sobre
+  5 bpw + NVFP4 no está certificada.
 - SGLang, vLLM y llama.cpp no están en la ruta de ejecución de Qwasar.
 - No hay copias físicas persistentes de KV en RAM/disco para restaurar la GPU
   instantáneamente después de un reinicio.

@@ -11,4 +11,4 @@ if [[ ! -x "$PI_BIN" ]]; then
     exit 1
 fi
 export PI_OFFLINE="${PI_OFFLINE:-1}"
-exec "$PI_BIN" --provider qwasar --model qwasar-qwen38-27b --thinking medium "$@"
+exec "$PI_BIN" --provider qwasar --model qwasar-qwen38-27b --thinking xhigh "$@"

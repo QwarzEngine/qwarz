@@ -2,7 +2,7 @@
 
 Qwasar is an independent inference-engine repository specialized for Qwen3.8-27B on one NVIDIA RTX 5090. The target runtime serves one persistent, agentic coding session with a native 262,144-token context and a model-specific 4.5–5.0 bpw artifact.
 
-The **hybrid v1** implements a Rust HTTP/SQLite supervisor, a persistent ExLlamaV3 worker, exact generated-token history, cancellation/recovery, and Pi-compatible streaming tools. It uses the pinned **EXL3 5 bpw + MTP + K8/V4** artifact. The dedicated service selects Flash/8192 prefill by default, with the original baseline available as a fallback; benchmark launchers and the donor remain unchanged.
+The **hybrid v1** implements a Rust HTTP/SQLite supervisor, a persistent ExLlamaV3 worker, exact generated-token history, cancellation/recovery, and Pi-compatible streaming tools. Production `flash` is the measured stack: pinned **EXL3 5 bpw + MTP6 + K8/V4**, **NVIDIA64 NVFP4 MLP** (192 matrices), Flash/8192 with **FP8 PRIMS** for Q≥8192, and **Attention64**. `baseline` is the original EXL3 Triton fallback. Benchmark launchers remain unchanged.
 
 See [Arquitectura v1: combinación de tecnologías y verificación de pesos](docs/arquitectura-v1.md)
 for the Spanish explanation of the design, measured performance, and live RTX 5090 artifact verification.
@@ -25,7 +25,9 @@ Then, from the project you want to work on:
 /home/rekeyea/Documents/llm/qwasar/scripts/pi_qwasar.sh
 ```
 
-Endpoint: `http://127.0.0.1:8800/v1`; model: `qwasar-qwen38-27b`.
+Endpoint: `http://127.0.0.1:8800/v1`; model: `qwasar-qwen38-27b`. Inline
+images (data URLs) are accepted in user messages; see the manual's Images
+section for limits and token cost.
 Use `python3 scripts/qwasar.py status`, `logs`, or `stop` to manage it.
 See the [v1 manual](docs/manual-v1.md) for persistence, supported API,
 security boundaries, verification, and performance limits. Cold 256K ingestion

@@ -108,7 +108,7 @@ def start(profile):
 
 
 def wait_ready(identity, child=None):
-    for attempt in range(300):
+    for attempt in range(540):
         if child is not None and child.poll() is not None or not same_process(identity):
             raise RuntimeError(f"Qwasar exited; inspect {LOG_FILE}")
         response = health()
@@ -122,7 +122,7 @@ def wait_ready(identity, child=None):
             except (OSError, ValueError, TypeError, KeyError, IndexError):
                 pass
         time.sleep(1)
-    raise RuntimeError(f"Startup is still pending after 300s; inspect {LOG_FILE} (PID {identity['pid']})")
+    raise RuntimeError(f"Startup is still pending after 540s; inspect {LOG_FILE} (PID {identity['pid']})")
 
 
 def stop():

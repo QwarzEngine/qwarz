@@ -74,3 +74,33 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_tools([{"type": "function", "function": {"name": "read", "parameters": {
                 "type": "object", "unevaluatedProperties": False}}}])
+
+    def test_ask_user_object_options_are_coerced_to_strings(self):
+        parser = StreamParser("off", [{"type": "function", "function": {"name": "ask_user_question",
+            "parameters": {"type": "object", "properties": {"question": {"type": "string"},
+            "options": {"type": "array", "items": {"type": "string"}}}, "required": ["question"]}}}], "resp_a")
+        parser.feed('<tool_call><function=ask_user_question><parameter=question>Choose</parameter>'
+                    '<parameter=options>[{"label":"Go ahead"},{"title":"Stop"}]</parameter></function></tool_call>')
+        arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments["options"], ["Go ahead", "Stop"])
+
+    def test_ask_user_string_options_are_wrapped_as_title_objects(self):
+        parser = StreamParser("off", [{"type": "function", "function": {"name": "ask_user",
+            "parameters": {"type": "object", "properties": {"question": {"type": "string"},
+            "options": {"type": "array", "items": {"type": "object", "properties": {
+                "title": {"type": "string"}, "description": {"type": "string"}},
+                "required": ["title"]}}}, "required": ["question"]}}}], "resp_a")
+        parser.feed('<tool_call><function=ask_user><parameter=question>Choose</parameter>'
+                    '<parameter=options>["Go ahead","Stop"]</parameter></function></tool_call>')
+        arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments["options"], [{"title": "Go ahead"}, {"title": "Stop"}])
+
+    def test_unclosed_tool_xml_is_detected_without_treating_closed_junk_as_incomplete(self):
+        cut = StreamParser("off", TOOLS, "resp_a")
+        cut.feed("<tool_call><function=edit><parameter=path>a.py")
+        self.assertTrue(cut.unclosed_tool_xml())
+        closed_junk = StreamParser("off", TOOLS, "resp_a")
+        closed_junk.feed("<tool_call>broken</tool_call>")
+        self.assertFalse(closed_junk.unclosed_tool_xml())
+        with self.assertRaises(ValueError):
+            closed_junk.finish()

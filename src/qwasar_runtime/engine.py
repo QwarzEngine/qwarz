@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import math
@@ -10,9 +10,21 @@ import re
 import time
 from types import SimpleNamespace
 
-from . import diagnostics
-from .parsing import SchemaValidationError, StreamParser, canonical, message_key, validate_messages, validate_tools
-from .rendering import Prompt, encode, render
+from . import diagnostics, vision
+from .parsing import SchemaValidationError, StreamParser, canonical, image_parts, message_key, validate_messages, validate_tools
+from .rendering import REASONING_CLOSE, Prompt, encode, render
+
+
+CONTENT_RESERVE = 1024
+REASONING_BUDGETS = {"off": 0, "low": 1024, "medium": 2048, "xhigh": 8192}
+
+
+def reasoning_token_cap(thinking, max_tokens, override=None):
+    if thinking == "off" or override == 0:
+        return 0
+    budget = REASONING_BUDGETS[thinking] if override is None else override
+    reserve = min(CONTENT_RESERVE, max(0, max_tokens // 2))
+    return min(budget, max(0, max_tokens - reserve))
 
 
 class RequestError(ValueError):
@@ -77,20 +89,28 @@ class Engine:
             raise RequestError("unsupported tool_choice")
         if choice == "required" and not functions:
             raise RequestError("required tool_choice needs tools")
+        override = request.get("reasoning_budget_tokens")
+        if override is not None and (type(override) is not int or not 0 <= override <= 32768):
+            raise RequestError("reasoning_budget_tokens must be an integer 0..32768")
         messages = validate_messages(request.get("messages"), tools)
         request["messages"] = messages
+        request["_reasoning_cap"] = reasoning_token_cap(thinking, maximum, override)
+        embeddings = self._resolve_images(messages, request.pop("images", None))
+        request["_embeddings"] = [item.handle for item in embeddings.values() if item.handle is not None]
         segments = []
         header = canonical({"tools": tools, "thinking": thinking, "tool_choice": choice})
+        if parent is not None and (not isinstance(parent, dict) or parent.get("version") != 1
+                or parent.get("runtime_identity") != self.backend.identity):
+            parent = None
         if parent is not None:
-            if not isinstance(parent, dict) or parent.get("version") != 1 or parent.get("runtime_identity") != self.backend.identity:
-                raise RequestError("parent snapshot belongs to a different runtime")
             segments = parent.get("segments", [])
             if not isinstance(segments, list) or any(not isinstance(segment.get("tokens"), list)
                     or not segment["tokens"] or any(type(token) is not int or token < 0 for token in segment["tokens"])
                     for segment in segments):
                 raise RequestError("invalid parent token segments")
         tokens, assistant_start, retained = render(self.backend.tokenizer, messages,
-            tools if choice != "none" else [], thinking, choice, segments)
+            tools if choice != "none" else [], thinking, choice, segments,
+            {sha256: item.tokens for sha256, item in embeddings.items()})
         unmatched = list(retained)
         for message in messages:
             if message["role"] == "assistant":
@@ -104,13 +124,39 @@ class Engine:
             if len(messages) > len(prior) and all(message_key(previous) == message_key(current)
                     for previous, current in zip(prior, messages)):
                 tape = parent.get("tape", [])
-                if tokens[:len(tape)] != tape:
-                    raise RequestError("append-only reconstruction changed exact parent tape")
+                # Suffix-only turn hints (PREFER_EDIT / CONTINUE_OR_ANSWER) are
+                # not stored in messages, so they move when the last role changes.
+                # Keep the reconstructed tokens; do not fail a live Pi turn.
+                if tape and vision.canonical_tape(tokens[:len(tape)]) != tape:
+                    parent = None
         reserve = max(16, self.backend.draft_tokens + 1)
         if len(tokens) + maximum + reserve > self.context_size:
             raise RequestError(f"prompt ({len(tokens)}) + max_tokens ({maximum}) + reserve ({reserve}) exceeds context_size ({self.context_size})",
                                "context_length_exceeded")
         return Prompt(tokens, assistant_start, messages, retained, request, header)
+
+    def _resolve_images(self, messages, supplied):
+        """Maps every referenced image sha256 to its embedding, in prompt order.
+        The supervisor attaches base64 data for each hash; a missing entry is a
+        request error, never a silent text-only fallback."""
+        parts = list(image_parts(messages))
+        if not parts:
+            return {}
+        if not self.backend.config.get("vision"):
+            raise RequestError("this runtime does not accept images")
+        if len(parts) > vision.MAX_IMAGES:
+            raise RequestError(f"at most {vision.MAX_IMAGES} images per request")
+        supplied = supplied if isinstance(supplied, dict) else {}
+        embeddings = {}
+        for part in parts:
+            sha256 = part["sha256"]
+            if sha256 in embeddings:
+                continue
+            entry = supplied.get(sha256)
+            if not isinstance(entry, dict):
+                raise RequestError(f"image {sha256} has no inline data", "unknown_image")
+            embeddings[sha256] = self.backend.image_embedding(sha256, part["media_type"], entry.get("data"))
+        return embeddings
 
     def generate(self, response_id, request, parent, cancellation):
         started = time.perf_counter()
@@ -129,6 +175,10 @@ class Engine:
         status = "cancelled" if cancellation.is_set() else "completed"
         sequence = []
         serial = None
+        tape = list(prompt.tokens)
+        reasoning_tokens = 0
+        close_reason = None
+        reasoning_cap = prompt.request.get("_reasoning_cap", 0)
         try:
             if status != "cancelled":
                 serial = self.backend.start(prompt.tokens, prompt.request)
@@ -145,15 +195,51 @@ class Engine:
                         if count:
                             last_emitted = now
                         emitted += count
+                        stopped = False
                         for event in events:
                             requeues += int(bool(event.get("requeue")))
+                            ids = event.get("token_ids") or []
+                            tape.extend(ids)
+                            was_reasoning = parser.channel == "reasoning"
                             for channel, text in parser.feed(event.get("text", "")):
                                 streamed_characters[channel] += len(text)
                                 if channel == "content" and text.strip() and first_content is None:
                                     first_content = now
                                 yield {"type": "delta", "id": response_id, "channel": channel, "text": text}
+                            if was_reasoning:
+                                reasoning_tokens += len(ids)
                             if event.get("eos"):
                                 final = event
+                            hit_budget = reasoning_cap > 0 and reasoning_tokens >= reasoning_cap
+                            hit_end = bool(event.get("eos") and event.get("eos_reason") == "stop_token")
+                            if (not close_reason and parser.channel == "reasoning"
+                                    and (hit_budget or hit_end)):
+                                if tape and tape[-1] == self.backend.end_token:
+                                    tape.pop()
+                                close_ids = encode(self.backend.tokenizer, REASONING_CLOSE)
+                                self.backend.stop_current(serial)
+                                for channel, text in parser.feed(REASONING_CLOSE):
+                                    streamed_characters[channel] += len(text)
+                                    if channel == "content" and text.strip() and first_content is None:
+                                        first_content = now
+                                    yield {"type": "delta", "id": response_id, "channel": channel, "text": text}
+                                tape.extend(close_ids)
+                                emitted += len(close_ids)
+                                leftover = prompt.request["max_tokens"] - (len(tape) - len(prompt.tokens))
+                                close_reason = "budget" if hit_budget else "unterminated"
+                                final = None
+                                stopped = True
+                                if leftover <= 0:
+                                    status = "incomplete"
+                                    final = {"eos": True, "eos_reason": "max_new_tokens",
+                                             "new_tokens": len(tape) - len(prompt.tokens), "synthetic": True}
+                                    break
+                                continuation = dict(prompt.request)
+                                continuation["max_tokens"] = leftover
+                                serial = self.backend.start(tape, continuation)
+                                break
+                        if stopped and status == "incomplete":
+                            break
                 if cancellation.is_set():
                     status = "cancelled"
             if status == "cancelled":
@@ -161,13 +247,29 @@ class Engine:
             else:
                 if final is None:
                     raise RuntimeError("generator drained without a terminal event")
-                sequence = self.backend.sequence(final)
-                if sequence[:len(prompt.tokens)] != prompt.tokens:
-                    raise RuntimeError("generator changed the exact prompt token tape")
-                status = "incomplete" if final.get("eos_reason") == "max_new_tokens" else "completed"
+                if final.get("synthetic"):
+                    sequence = tape
+                else:
+                    sequence = self.backend.sequence(final)
+                    if sequence[:len(prompt.tokens)] != prompt.tokens:
+                        raise RuntimeError("generator changed the exact prompt token tape")
+                if status != "incomplete":
+                    status = "incomplete" if final.get("eos_reason") == "max_new_tokens" else "completed"
                 if status == "completed" and sequence[-1] != self.backend.end_token:
                     raise ValueError("generation has no actual native im_end terminator")
-            message = parser.finish(complete=status == "completed")
+                if status == "completed" and parser.channel == "reasoning":
+                    status = "incomplete"
+                if parser.in_tools and parser.unclosed_tool_xml():
+                    status = "incomplete"
+                    self._capture_incomplete_tools(parser, response_id, prompt)
+            try:
+                message = parser.finish(complete=status == "completed")
+            except (SchemaValidationError, ValueError) as error:
+                if not parser.in_tools and "reasoning" not in str(error):
+                    raise
+                status = "incomplete"
+                self._capture_incomplete_tools(parser, response_id, prompt, error)
+                message = parser.finish(complete=False)
             for channel, field in (("content", "content"), ("reasoning", "reasoning_content")):
                 tail = message[field][streamed_characters[channel]:]
                 if tail:
@@ -196,8 +298,8 @@ class Engine:
             yield terminal
             return
         finished = time.perf_counter()
-        generated = int(final.get("new_tokens", emitted)) if final else emitted
-        valid = requeues == 0 and status != "cancelled"
+        generated = len(sequence) - len(prompt.tokens) if sequence else (int(final.get("new_tokens", emitted)) if final else emitted)
+        valid = requeues == 0 and status != "cancelled" and not (final or {}).get("synthetic")
         cached = int(final.get("cached_tokens", 0)) if final and valid else None
         accepted = int(final.get("accepted_draft_tokens", 0)) if final and valid else None
         rejected = int(final.get("rejected_draft_tokens", 0)) if final and valid else None
@@ -214,23 +316,45 @@ class Engine:
             "draft_acceptance": accepted / (accepted + rejected) if accepted is not None and accepted + rejected else None,
             "host_prefill_ms": float(final.get("time_prefill", 0)) * 1000 if final and valid else None,
             "finish_reason": final.get("eos_reason") if final else "cancelled",
+            "reasoning_closed": close_reason,
+            "reasoning_tokens": reasoning_tokens,
         }
         snapshot = None
         if status == "completed":
             segment = {"message": message, "tokens": sequence[prompt.assistant_start:]}
             snapshot = {"version": 1, "runtime_identity": self.backend.identity,
                         "header": prompt.header, "messages": prompt.messages + [message],
-                        "tape": sequence, "segments": prompt.segments + [segment]}
+                        "tape": vision.canonical_tape(sequence), "segments": prompt.segments + [segment]}
         yield {"type": "terminal", "id": response_id, "status": status, "message": message,
                "usage": {"prompt_tokens": len(prompt.tokens), "completion_tokens": generated,
                          "total_tokens": len(prompt.tokens) + generated,
                          "prompt_tokens_details": {"cached_tokens": cached}},
                "metrics": metrics, "snapshot": snapshot, "error": None}
 
+    def _capture_incomplete_tools(self, parser, response_id, prompt, error=None):
+        evidence = parser.tool_diagnostic or ({"raw_tool_calls": parser.xml, "tool_schemas": parser.functions,
+            "tool": None, "parsed_arguments": {}, "stage": "incomplete_native_parse", "call_index": 0}
+            if parser.xml else None)
+        if evidence is None or self.diagnostic_directory is None:
+            return
+        evidence = {**evidence, "response_id": response_id, "runtime_identity": self.backend.identity,
+                    "parser_sha256": self.parser_sha256, "thinking": prompt.request["thinking"],
+                    "tool_choice": prompt.request["tool_choice"]}
+        if error is not None:
+            evidence["error"] = {"class": type(error).__name__, "message": str(error)}
+        if isinstance(error, SchemaValidationError):
+            evidence["validation"] = {"path": error.path, "expected_type": error.expected_type,
+                                      "actual_type": error.actual_type}
+        try:
+            diagnostics.save_diagnostic(self.diagnostic_directory, evidence)
+        except Exception:
+            pass
+
 
 class FakeTokenizer:
     special = {"<|im_start|>": 1000001, "<|im_end|>": 1000002,
-               "<think>": 1000003, "</think>": 1000004}
+               "<think>": 1000003, "</think>": 1000004,
+               "<|vision_start|>": 1000005, "<|vision_end|>": 1000006}
 
     def __init__(self):
         self.tokenizer = SimpleNamespace(encode_special_tokens=False, encode=self.literal)
@@ -261,35 +385,62 @@ class FakeTokenizer:
 class FakeBackend:
     identity = "qwasar-explicit-fake-v1"
     draft_tokens = 0
-    config = {"fake": True, "quantization": "fake", "prefill": "fake"}
+    config = {"fake": True, "quantization": "fake", "prefill": "fake", "vision": True,
+              "max_image_pixels": vision.DEFAULT_MAX_PIXELS, "max_images": vision.MAX_IMAGES}
 
     def __init__(self):
         self.tokenizer = FakeTokenizer()
         self.end_token = self.tokenizer.special["<|im_end|>"]
         self.enqueued = self.resets = 0
         self.active = False
+        self.images = vision.EmbeddingCache(vision.DEFAULT_CACHE_ENTRIES)
+
+    def image_embedding(self, sha256, media_type, data):
+        cached = self.images.get(sha256)
+        if cached is not None:
+            return cached
+        raw = vision.decode_image_data(sha256, media_type, data)
+        width, height = vision.png_size(raw)
+        tokens = vision.fake_tokens(sha256, width, height, vision.DEFAULT_MAX_PIXELS,
+                                    self.tokenizer.special["<|vision_start|>"], self.tokenizer.special["<|vision_end|>"])
+        return self.images.put(vision.ImageEmbedding(sha256, tokens, width, height))
 
     def start(self, tokens, request):
         self.enqueued += 1
         self.tape = list(tokens)
         latest = request["messages"][-1]["content"]
         self.slow = "[fake:slow]" in latest
-        response = "Fake runtime response."
+        continuation = request["thinking"] != "off" and self._ends_with_think_close(tokens)
         tools = request["tools"]
-        if tools and request["tool_choice"] != "none" and ("[fake:tool]" in latest or request["tool_choice"] == "required" or isinstance(request["tool_choice"], dict)):
-            name = request["tool_choice"]["function"]["name"] if isinstance(request["tool_choice"], dict) else tools[0]["function"]["name"]
-            function = next(tool["function"] for tool in tools if tool["function"]["name"] == name)
-            schema = function.get("parameters", {})
-            values = {key: self.fixture(schema.get("properties", {}).get(key, {})) for key in schema.get("required", [])}
-            response = "<tool_call>\n<function=" + name + ">\n" + "".join(
-                "<parameter=" + key + ">\n" + (value if isinstance(value, str) else canonical(value)) + "\n</parameter>\n"
-                for key, value in values.items()) + "</function>\n</tool_call>"
-        if request["thinking"] != "off":
-            response = "Fake reasoning.</think>\n\n" + response
+        if continuation:
+            response = "Forced answer."
+        elif "[fake:unclosed-think]" in latest:
+            response = "A" * 256
+        elif "[fake:think-then-end]" in latest:
+            response = "Unclosed thought."
+        else:
+            response = "Fake runtime response."
+            if tools and request["tool_choice"] != "none" and ("[fake:tool]" in latest or request["tool_choice"] == "required" or isinstance(request["tool_choice"], dict)):
+                name = request["tool_choice"]["function"]["name"] if isinstance(request["tool_choice"], dict) else tools[0]["function"]["name"]
+                function = next(tool["function"] for tool in tools if tool["function"]["name"] == name)
+                schema = function.get("parameters", {})
+                values = {key: self.fixture(schema.get("properties", {}).get(key, {})) for key in schema.get("required", [])}
+                response = "<tool_call>\n<function=" + name + ">\n" + "".join(
+                    "<parameter=" + key + ">\n" + (value if isinstance(value, str) else canonical(value)) + "\n</parameter>\n"
+                    for key, value in values.items()) + "</function>\n</tool_call>"
+            if "[fake:truncated-tool]" in latest and tools:
+                name = tools[0]["function"]["name"]
+                response = "<tool_call><function=" + name + "><parameter=x>cut"
+            if request["thinking"] != "off":
+                response = "Fake reasoning.</think>\n\n" + response
         self.chunks = list(response)
         self.maximum, self.generated = request["max_tokens"], 0
         self.active = True
         return self.enqueued
+
+    def _ends_with_think_close(self, tokens):
+        close_ids = encode(self.tokenizer, REASONING_CLOSE)
+        return len(tokens) >= len(close_ids) and tokens[-len(close_ids):] == close_ids
 
     @staticmethod
     def fixture(schema):
@@ -329,6 +480,9 @@ class FakeBackend:
 
     def sequence(self, final):
         return self.tape
+
+    def stop_current(self, serial):
+        self.active = False
 
     def cancel_reset(self, serial):
         self.active = False
@@ -380,19 +534,59 @@ class ExLlamaBackend:
         for source in sorted(runtime_path.rglob("*.py")):
             runtime_hash.update(str(source.relative_to(runtime_path)).encode())
             runtime_hash.update(source.read_bytes())
-        self.identity = hashlib.sha256(canonical({"model": str(model_path), "files": hashes,
+        hybrid = None
+        donor = None
+        if prefill == "flash":
+            from . import hybrid as hybrid_mod
+            hybrid_mod.prepare_environment()
+            donor = hybrid_mod.verify_donor()
+            hybrid_mod.install_prims()
+            hybrid = hybrid_mod
+        identity_body = {"model": str(model_path), "files": hashes,
             "artifact_sha256": artifact_sha256, "runtime": runtime_hash.hexdigest(),
-            "renderer_abi": 2, "quantization": "5bpw-K8V4-MTP"}).encode()).hexdigest()
-        self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
-            model_path=model_path, draft_model_path=model_path, cache_size=context_size,
-            cache_quant="8,4", gpu_split_gb=gpu_split_gb, draft_method="mtp", num_draft_tokens=6)
+            "renderer_abi": 2, "quantization": hybrid.QUANTIZATION if hybrid else "5bpw-K8V4-MTP"}
+        if donor is not None:
+            identity_body["mlp_donor_revision"] = donor["revision"]
+            identity_body["mlp_donor_shards"] = {name: info["sha256"] for name, info in donor["shards"].items()}
+        self.identity = hashlib.sha256(canonical(identity_body).encode()).hexdigest()
+        self._lifetime = ExitStack()
+        try:
+            if hybrid is not None:
+                self._lifetime.enter_context(hybrid.attention_context())
+                with hybrid.replace_mlps() as replaced:
+                    self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
+                        model_path=model_path, draft_model_path=model_path, cache_size=context_size,
+                        cache_quant="8,4", gpu_split_gb=gpu_split_gb, draft_method="mtp", num_draft_tokens=6)
+                    if len(replaced) != hybrid.EXPECTED_MLP:
+                        raise ValueError(f"expected {hybrid.EXPECTED_MLP} NVIDIA MLP replacements, got {len(replaced)}")
+                graphed = hybrid.graph_mlps(self.generator.model)
+                if len(graphed) != hybrid.EXPECTED_GRAPHS:
+                    raise ValueError(f"expected {hybrid.EXPECTED_GRAPHS} NVIDIA MLP graphs, got {len(graphed)}")
+            else:
+                self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
+                    model_path=model_path, draft_model_path=model_path, cache_size=context_size,
+                    cache_quant="8,4", gpu_split_gb=gpu_split_gb, draft_method="mtp", num_draft_tokens=6)
+            # The vision tower stays EXL3/BF16 and loads after the NVIDIA MLP swap so the
+            # donor replacement count (192 text MLPs) is unaffected by model.visual.* modules.
+            self.vision = vision.VisionRuntime(self.generator, self.tokenizer)
+        except Exception:
+            self._lifetime.close()
+            raise
         self.end_token = encode(self.tokenizer, "<|im_end|>")[0]
         self.draft_tokens = self.generator.num_draft_tokens
         self.prefill = prefill
-        self.config = {"fake": False, "model_path": str(model_path), "quantization": "EXL3 5bpw",
+        self.config = {"fake": False, "model_path": str(model_path),
+            "vision": True, "max_image_pixels": self.vision.max_pixels, "max_images": vision.MAX_IMAGES,
+            "image_cache_entries": self.vision.cache.entries,
+            "quantization": "EXL3 5bpw + NVIDIA64 NVFP4 MLP" if hybrid else "EXL3 5bpw",
             "cache_quantization": "K8/V4", "draft_method": "mtp", "draft_tokens": self.draft_tokens,
             "prefill": prefill, "native_context_size": native, "artifact_hashes": hashes,
-            "artifact_sha256": artifact_sha256, "runtime_sha256": runtime_hash.hexdigest()}
+            "artifact_sha256": artifact_sha256, "runtime_sha256": runtime_hash.hexdigest(),
+            "mlp_donor": donor["revision"] if donor else None,
+            "mlp_donor_path": donor["path"] if donor else None,
+            "fp8_prims": hybrid is not None, "prims_min_query": hybrid.PRIMS_MIN_QUERY if hybrid else None,
+            "p_scale": hybrid.P_SCALE if hybrid else None, "attention64": hybrid is not None,
+            "mlp_graphs": hybrid.EXPECTED_GRAPHS if hybrid else 0}
 
     def start(self, tokens, request):
         import torch
@@ -403,8 +597,12 @@ class ExLlamaBackend:
             temperature=request["temperature"], top_p=request["top_p"], top_k=20, min_p=0.0,
             pres_p=1.5 if request["thinking"] == "off" else 0.0)
         self.job = Job(input_ids=torch.tensor([tokens], dtype=torch.long), max_new_tokens=request["max_tokens"],
-                       sampler=sampler, seed=request["seed"], stop_conditions=[self.end_token], decode_special_tokens=True)
+                       sampler=sampler, seed=request["seed"], stop_conditions=[self.end_token], decode_special_tokens=True,
+                       embeddings=request.get("_embeddings") or None)
         return self.generator.enqueue(self.job)
+
+    def image_embedding(self, sha256, media_type, data):
+        return self.vision.embed(sha256, media_type, data)
 
     def tuning(self):
         from qwasar_bench.prefill_tuning import workload_tuning_context
@@ -427,10 +625,13 @@ class ExLlamaBackend:
     def sequence(self, final):
         return final["job"].sequences[0].sequence_ids.torch().flatten().tolist()
 
-    def cancel_reset(self, serial):
-        from qwasar_bench.fidelity_probe import fresh_generator
-
+    def stop_current(self, serial):
         for job in list(self.generator.active_jobs) + list(self.generator.pending_jobs):
             if serial is None or job.serial_number == serial:
                 self.generator.cancel(job)
+
+    def cancel_reset(self, serial):
+        from qwasar_bench.fidelity_probe import fresh_generator
+
+        self.stop_current(serial)
         fresh_generator(self.generator)

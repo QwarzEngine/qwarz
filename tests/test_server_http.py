@@ -84,7 +84,9 @@ def payloads(response):
 def test_streaming_models_validation_and_idempotent_replay(tmp_path):
     with server(tmp_path) as base:
         with request(base, "/v1/models") as response:
-            assert json.load(response)["data"][0]["id"] == "qwasar-qwen38-27b"
+            listing = json.load(response)
+            assert listing["data"][0]["id"] == "qwasar-qwen38-27b"
+            assert listing["models"][0]["slug"] == "qwasar-qwen38-27b"
         with request(base, "/v1/chat/completions", body(stream=True)) as response:
             chunks = list(payloads(response))
         assert any(chunk.get("choices", [{}])[0].get("delta", {}).get("content") for chunk in chunks if chunk.get("choices"))
@@ -238,3 +240,43 @@ def test_duplicate_server_cannot_recover_live_owners_database(tmp_path, same_por
                 duplicate.terminate()
             duplicate.wait(timeout=5)
             response.close()
+
+
+def data_url(width, height):
+    from test_runtime_vision import png_bytes
+    import base64
+    raw = png_bytes(width, height)
+    return "data:image/png;base64," + base64.b64encode(raw).decode()
+
+
+def test_inline_images_flow_through_chat_and_responses_parents(tmp_path):
+    parts = [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": data_url(64, 64)}}]
+    with server(tmp_path) as base:
+        with request(base, "/v1/models") as response:
+            assert json.load(response)["models"][0]["input_modalities"] == ["text", "image"]
+        with request(base, "/v1/chat/completions", body("describe")) as response:
+            text_only = json.load(response)["usage"]["prompt_tokens"]
+        with request(base, "/v1/chat/completions", body(parts)) as response:
+            result = json.load(response)
+        assert result["choices"][0]["finish_reason"] == "stop"
+        assert result["usage"]["prompt_tokens"] == text_only + 2 * 2 + 2
+        # Responses: input_image on the first turn, hash-only reference via the durable parent.
+        first_body = {"model": "qwasar-qwen38-27b", "max_output_tokens": 64, "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "look"}, {"type": "input_image", "image_url": data_url(64, 32)}]}]}
+        with request(base, "/v1/responses", first_body) as response:
+            first = json.load(response)
+        assert first["status"] == "completed"
+    with server(tmp_path) as base:
+        with request(base, "/v1/responses", {"model": "qwasar-qwen38-27b", "input": "again",
+                     "previous_response_id": first["id"], "max_output_tokens": 64}) as response:
+            assert json.load(response)["status"] == "completed"
+        # Remote URLs, images outside user messages and unknown hashes are rejected before dispatch.
+        for content in ([{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}],
+                        [{"type": "image", "sha256": "0" * 64, "media_type": "image/png"}]):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                request(base, "/v1/chat/completions", body(content))
+            assert error.value.code == 400
+        with pytest.raises(urllib.error.HTTPError) as error:
+            request(base, "/v1/chat/completions", {"model": "qwasar-qwen38-27b", "max_tokens": 64, "messages": [
+                {"role": "system", "content": parts}, {"role": "user", "content": "hi"}]})
+        assert error.value.code == 400

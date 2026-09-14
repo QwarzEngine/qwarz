@@ -1,6 +1,6 @@
 # Donante NVIDIA NVFP4 (Fase 1) — 2026-09-10
 
-**Estado:** checkpoint verificado, adaptador con inversión de **ambas** escalas globales, oráculo de cuatro puertas pasado (`nvidia-check10`). A/B completo sobre la matriz congelada: **NVIDIA64 = control en código (11/16), JSON 2/2, −0,98 GiB, TTFT −42% (32K) / −27% (131K), decode a la par; aceptación MTP −4,3 pp (falla el criterio 3 de ±3 pp)**. Minima64 en la misma matriz: 8/16, −5,8 pp. Ganador de Fase 1: NVIDIA64; promoción pendiente de la decisión del usuario sobre el criterio 3. Detalle al final.
+**Estado:** checkpoint verificado, adaptador con inversión de **ambas** escalas globales, oráculo de cuatro puertas pasado (`nvidia-check10`). A/B completo sobre la matriz congelada: **NVIDIA64 = control en código (11/16), JSON 2/2, −0,98 GiB, TTFT −42% (32K) / −27% (131K), decode a la par; aceptación MTP −4,3 pp**. Minima64 en la misma matriz: 8/16, −5,8 pp. **Promovido a Fase 2 el 2026-09-11** al relajar el criterio 3 de ±3 a ±5 pp. El JSON histórico `gate-decision-nvidia64e.json` conserva el fallo ±3; el veredicto vivo es `gate-decision-nvidia64e-pp5.json`. Detalle al final.
 
 ## Corrección (18:00): el primer A/B produjo ruido en 19/19 celdas con el oráculo en verde
 
@@ -92,7 +92,7 @@ Mismo runner, grafos activos, 192 proyecciones reemplazadas. `gate-decision-mini
 
 Los 12 programas de Minima que se ejecutaron pasan el oráculo independiente 7/7; sus fallos son 4 truncados (razonamiento más largo) y 4 tests generados con una expectativa errónea. Es un modelo algo más verboso y menos alineado con el drafter, no uno roto. La muestra previa de 6 celdas LRU (4/6) había sobreestimado su paridad con el control.
 
-**Decisión Fase 1:** el donante para Fase 2 es **NVIDIA64**. Supera a Minima64 en código (11 vs 8), aceptación (−4,3 vs −5,8 pp), TTFT (3–4% mejor) y decode (+2% vs −1% a 131K). Frente al control cumple los criterios 1, 2 y 4 y **no** cumple el 3 (±3 pp) en dos corridas independientes. Ese criterio es un proxy de desplazamiento de distribución, no una métrica de usuario: el desplazamiento existe (~4 pp menos aceptación) pero no cuesta ni calidad ni tok/s en esta matriz. La promoción a Fase 2 requiere que el usuario decida si relaja el criterio 3 (por ejemplo a ±5 pp, o sustituirlo por «decode tok/s ≥ control −5%») o si exige recuperar la aceptación (ninguna palanca conocida: el drafter MTP es EXL3 y fijo).
+**Decisión Fase 1 (2026-09-11):** el donante de Fase 2 es **NVIDIA64**. Supera a Minima64 en código (11 vs 8), aceptación (−4,3 vs −5,8 pp), TTFT (3–4% mejor) y decode (+2% vs −1% a 131K). Frente al control cumple 1, 2 y 4. Con el candado original de ±3 pp fallaba el 3 en dos corridas; con la banda relajada a ±5 pp **pasa**. El corrimiento ~4 pp existe y se acepta: no costó calidad ni tok/s en esta matriz, y no hay palanca para devolverlo (drafter MTP EXL3 fijo). Minima64 sigue fuera (código y aceptación).
 
 Artefactos: `candidate-nvidia64{d,e}`, `candidate-minima64a`, `grades-candidate-*`, `gate-decision-{nvidia64d,nvidia64e,minima64a}.json`.
 

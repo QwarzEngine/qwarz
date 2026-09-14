@@ -9,6 +9,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _same_qwasar(existing, provider):
+    return (isinstance(existing, dict) and existing.get("baseUrl") == provider["baseUrl"]
+            and existing.get("api") == provider["api"])
+
+
 def configure(target: Path) -> Path | None:
     provider = json.loads((ROOT / "integrations/pi/models.json").read_text())["providers"]["qwasar"]
     original = target.read_bytes() if target.exists() else None
@@ -16,9 +21,10 @@ def configure(target: Path) -> Path | None:
     if not isinstance(config, dict) or not isinstance(config.get("providers", {}), dict):
         raise ValueError("Pi models.json must contain an object with object providers")
     providers = config.setdefault("providers", {})
-    if "qwasar" in providers:
-        if providers["qwasar"] == provider:
-            return None
+    existing = providers.get("qwasar")
+    if existing == provider:
+        return None
+    if existing is not None and not _same_qwasar(existing, provider):
         raise ValueError("Existing qwasar provider differs; refusing to overwrite it")
     providers["qwasar"] = provider
     target.parent.mkdir(parents=True, exist_ok=True)

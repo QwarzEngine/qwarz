@@ -35,6 +35,10 @@ class RenderingTests(unittest.TestCase):
                    "tools": [changed]}
         prompt = engine.prepare(request, snapshot)
         self.assertEqual(prompt.segments[0]["tokens"], snapshot["segments"][0]["tokens"])
+        same = {"messages": snapshot["messages"] + [{"role": "tool", "tool_call_id": call["id"], "content": "result"}],
+                "tools": [tool]}
+        prefix = engine.prepare(same, snapshot)
+        self.assertEqual(prefix.tokens[:len(snapshot["tape"])], snapshot["tape"])
 
 
 @unittest.skipUnless(os.environ.get("QWASAR_TEST_MODEL"), "set QWASAR_TEST_MODEL for CPU artifact template tests")

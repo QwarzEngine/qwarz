@@ -1,0 +1,20 @@
+{
+  "revision": "dbb8f445b3145f8a4c18ddc769f032d57d32867c",
+  "repository": "nvidia/Qwen3.8-27B-NVFP4",
+  "path": "/home/rekeyea/models/nvidia-qwen38-27b-nvfp4/dbb8f445b3145f8a4c18ddc769f032d57d32867c",
+  "coverage": "192 MLP matrices (layers 0-63 gate/up/down); GDN, attention, embed, lm_head and MTP stay EXL3",
+  "shards": {
+    "model-00001-of-00003.safetensors": {
+      "size": 9965652544,
+      "sha256": "7d0fd155118901373eb0fd13ed3aae68f95be747bc205be72ebc41739c25ee80"
+    },
+    "model-00002-of-00003.safetensors": {
+      "size": 9985757064,
+      "sha256": "98a7e9486baa860c792c9463a770cb9d017696bdd17606300a5b9334149f4c27"
+    },
+    "model-00003-of-00003.safetensors": {
+      "size": 1970287672,
+      "sha256": "0506ad35dc21469708e7813bd76c592cef08bd0317b4a1fe899745ebe2435271"
+    }
+  }
+}

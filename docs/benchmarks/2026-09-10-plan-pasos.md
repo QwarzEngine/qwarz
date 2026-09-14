@@ -11,10 +11,10 @@ Mejorar Qwasar (Qwen 3.8 27B, RTX 5090, 32 GB, MTP6, K8/V4, 256K) sin sustituir 
 | Fase | Qué | Estado |
 |---|---|---|
 | 0 | Puerta de calidad ampliada + baseline EXL3 | **Congelada.** Control 11/16 código, JSON 2/2, pico 24,79 GiB. |
-| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Medida completa.** Adaptador corregido (faltaba invertir `input_scale`; `nvidia64b` era ruido con el oráculo en verde), oráculo de 4 puertas (`nvidia-check10`). `candidate-nvidia64e`: código 11/16 = control, JSON 2/2, −0,98 GiB, TTFT −42%/−27%, decode a la par, **aceptación MTP −4,3 pp (falla ±3 pp)**. `candidate-minima64a`: 8/16, −5,8 pp. Ganador: NVIDIA64. Promoción bloqueada en el criterio 3 — decisión del usuario. Ver [donante](2026-09-10-nvidia-donor.md). |
-| 2 | Ganador de Fase 1 + FP8 PRIMS (P×256) + Attention64 + K8/V4 + MTP6 → producción | No empezada. Esperado (medido en híbrido previo): TTFT 258K ~132→~69 s no se reclama hasta medirlo otra vez sobre el ganador. |
+| 1 | Donante NVIDIA MLP64: shim, oráculo, A/B vs Minima64 sobre la misma matriz | **Cerrada.** `candidate-nvidia64e`: 11/16, JSON 2/2, −0,98 GiB, TTFT −42%/−27%, decode a la par, aceptación −4,3 pp. Minima64: 8/16, −5,8 pp. **2026-09-11:** el usuario relajó el criterio 3 a ±5 pp; NVIDIA64 pasa, Minima64 no. Ver [donante](2026-09-10-nvidia-donor.md). |
+| 2 | NVIDIA64 + FP8 PRIMS (P×256) + Attention64 a 32K/64K/128K/256K | **Medida. Puerta ±5 pp pasa.** 19/32 = 19/32, JSON 4/4, aceptación −0,78 pp, −0,46 GiB. TTFT −47/−47/−48/−50% a 32/64/128/256K; decode +4/+6/+16/+21%. 258K 133,5→67,3 s. Ver [resultados](2026-09-11-phase2-results.md). Producción no cambiada. |
 | 3 | Decode: XQA + KV NVFP4 en target, resolviendo antes el runtime de cola FP16 2K | No empezada. Bloqueo conocido: XQA local no expone LSE; el prototipo SGLang anterior tuvo acceso ilegal. |
-| 4 | Cabeza MTP 64K (la memoria la paga Fase 3). Métrica: tiempo por token aceptado | No empezada. |
+| 4 | Cabeza MTP 64K (la memoria la paga Fase 3). Métrica: tiempo por token aceptado | **Medida sobre `flash`, no promovida (2026-09-11).** −2,8 ms/verify constantes; aceptación −3,9 pp; decode +9,8 % a 32K, +2,6 % a 256K; 21/32, JSON 4/4; memoria +0,86 GiB rompe el criterio 4. Grafo CUDA del bucle de 6 pasos medido encima: −0,35 ms/verify a 32K, −0,76 a 256K, ids idénticos; fusión Triton de los kernels pequeños: −0,09 / −0,18 más (167 → 127 kernels). La fase draft queda limitada por bytes de pesos (sub-head 37 %). Ver [fase draft](2026-09-11-draft-phase.md). |
 | 5 | Quitar los 16 `.item()` de `cache_seqlens` y auditar el hand-off MTP target→draft | **`.item()` eliminado y verificado** (eran 17 por chunk, incluida la capa MTP): 3.468/3.468 aciertos, 0 sincronizaciones, sin cambio medible de TTFT. Ver [resultados](2026-09-10-item-sync-results.md). Auditoría del hand-off MTP pendiente. |
 | 6 | Vigilancia: llama.cpp #28572, vLLM #52244, FlashInfer K/V mixto | No empezada. |
 
@@ -26,7 +26,7 @@ Un candidato pasa si y solo si, contra el control EXL3 en `results/20260910-qual
 
 1. Código: candidato ≥ control en entregas completas sobre 16 celdas (control = **11/16**).
 2. JSON: 2/2.
-3. Aceptación MTP: mediana de `speculative_acceptance_rate` a ±3 pp del control (si el candidato la expone; el control no la registró).
+3. Aceptación MTP: mediana de `draft_acceptance` a **±5 pp** del control (enmienda 2026-09-11; el candado original era ±3).
 4. Memoria: pico asignado ≤ 24,79 + 0,5 GiB.
 
 La decide `results/20260910-quality-gate/aggregate.py`. Empate agregado no demuestra equivalencia: se reportan fallos por celda.
@@ -54,7 +54,7 @@ El error final es de nombres, no de GPU: el artefacto EXL3 **no guarda** `.weigh
 2. ~~A/B NVIDIA-MLP64~~ **Hecho** (`candidate-nvidia64d` eager, `candidate-nvidia64e` con grafos MLP). El runner omitía `graph_selected_mlps()` y `64d` perdió −17% de decode a 32K por lanzamientos Python; `64e` lo recupera (−3%/+2%). El runner captura grafos por defecto.
 3. ~~Calificar y decidir~~ **Hecho.** `aggregate.py` tenía dos bugs (nunca había corrido): `KeyError` en el criterio JSON y campo de aceptación nulo; corregidos. `gate-decision-nvidia64e.json`: criterios 1, 2, 4 pasan; 3 falla (−4,3 pp).
 4. ~~Ganador~~ **NVIDIA64** (Minima64 en la misma matriz: 8/16, −5,8 pp, 4 truncados). La muestra LRU de 6 celdas había sobreestimado a Minima.
-5. **Decisión pendiente del usuario antes de Fase 2:** el criterio 3 (±3 pp de aceptación) lo falla el mejor donante en dos corridas independientes sin coste en calidad ni tok/s. Opciones: (a) relajar a ±5 pp o sustituir por «decode ≥ control −5%» y promover NVIDIA64 a Fase 2; (b) mantener el criterio y cerrar la línea NVFP4-MLP (el prefill se buscaría entonces sólo con FP8 PRIMS, −31% medido en Q=8192). No hay palanca conocida para recuperar la aceptación: el drafter MTP es EXL3 y fijo.
+5. ~~Decisión del criterio 3~~ **Hecha (2026-09-11):** banda ±5 pp. `gate-decision-nvidia64e-pp5.json` pasa; `gate-decision-minima64a-pp5.json` sigue fallando (código 8/16 y −5,8 pp). NVIDIA64 es el donante de Fase 2. El corrimiento de aceptación se documenta, no se “arregla”: el drafter MTP es EXL3 y fijo.
 
 Comando del oráculo:
 
@@ -66,7 +66,18 @@ Comando del oráculo:
   --output results/20260910-quality-gate/nvidia-check5
 ```
 
-El servicio de producción se detiene durante la corrida y `managed.py` lo vuelve a dejar en MTP6. No lanzar otra cosa en GPU0 a la vez.
+## Fase 2 — primer A/B (aún no lanzado)
+
+Misma matriz, mismo `candidate_runner` con PRIMS y Attention64 **encendidos** sobre NVIDIA64 (en Fase 1 iban apagados a propósito). Control: `control` + `control-ttl2`. Criterio vivo: ±5 pp.
+
+Orden de trabajo:
+
+1. Extender `candidate_runner.py` con `--fp8-prims` y `--attention64` (parche P×256, router Q=8192, perfil `decode64`). No mezclar XQA ni cabeza MTP 64K.
+2. Smoke corto (warmup 4K + una celda 32K) vía `managed.py` antes de la matriz.
+3. A/B completo `candidate-nvidia64e-prims-att64` → `aggregate.py --acceptance-pp 5`.
+4. No reclamar el TTFT 258K ~132→~69 s del híbrido Minima hasta medirlo otra vez. La puerta de Fase 2 no incluye 258K; esa verificación va después si la matriz pasa.
+
+El servicio se detiene durante cada corrida GPU y `managed.py` lo restaura en MTP6. No lanzar otra cosa en GPU0 a la vez.
 
 ## Artefactos
 
