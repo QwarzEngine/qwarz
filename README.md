@@ -1,6 +1,30 @@
-# Qwasar
+# Qwarz
 
-Qwasar is an independent inference-engine repository specialized for Qwen3.8-27B on one NVIDIA RTX 5090. The target runtime serves one persistent, agentic coding session with a native 262,144-token context and a model-specific 4.5–5.0 bpw artifact.
+Qwarz is an independent inference-engine repository specialized for Qwen3.8-27B on one NVIDIA RTX 5090. The target runtime serves one persistent, agentic coding session with a native 262,144-token context and a model-specific 4.5–5.0 bpw artifact.
+
+## Metrics
+
+Live service on 2026-09-14 after the 18:07 restart (70 completed turns, production `flash` on the RTX 5090). Typical prompt in that window was ~45–50K with prefix reuse. These are measured samples, not an SLA.
+
+| | Median | p90 |
+| --- | ---: | ---: |
+| End-to-end tokens/s (output / wall time, includes prefill) | **112** | 173 |
+| Decode tokens/s (after the first token) | **158** | 213 |
+| Prefill tokens/s (new physical tokens / host prefill) | **3,227** | 4,247 |
+| TTFT (first token, includes prefill) | **441 ms** | 1.09 s |
+
+Warm ~50K continuations: TTFT **260–550 ms**, decode **~110–175 tok/s**, append prefill **~1,800–3,700 tok/s**. Large prefills (≥8K, PRIMS path): **5,300–6,800 tok/s**, TTFT **2.4–4.2 s**. Decode tracks MTP acceptance (~0.62 this session); a 50K turn at 0.21 acceptance fell to 82 tok/s.
+
+Phase 2 quality-gate medians (thinking medium, not warm chat):
+
+| Context | TTFT | Decode |
+| --- | ---: | ---: |
+| 32K | 5.17 s | 200 tok/s |
+| 64K | 11.27 s | 184 tok/s |
+| 128K | 26.63 s | 164 tok/s |
+| 256K | 67.27 s | 122 tok/s |
+
+All-time store (4,598 completed turns, 5–14 Sep, many ~130K sessions): decode **138 tok/s**, end-to-end **98 tok/s**, TTFT **881 ms**. The 254K warm HTTP sample is **97.19 tok/s** and **0.593 s** to first content.
 
 The **hybrid v1** implements a Rust HTTP/SQLite supervisor, a persistent ExLlamaV3 worker, exact generated-token history, cancellation/recovery, and Pi-compatible streaming tools. Production `flash` is the measured stack: pinned **EXL3 5 bpw + MTP6 + K8/V4**, **NVIDIA64 NVFP4 MLP** (192 matrices), Flash/8192 with **FP8 PRIMS** for Q≥8192, and **Attention64**. `baseline` is the original EXL3 Triton fallback. Benchmark launchers remain unchanged.
 
@@ -84,7 +108,7 @@ QWASAR_REPETITIONS=3 \
 
 The first full result is documented in `docs/benchmarks/2026-09-04-exl3-resident-session.md`. It demonstrates prefix-page and recurrent-checkpoint reuse across jobs. The observed TTFT growth has not yet been attributed to individual kernels; see `docs/benchmarks/2026-09-04-review-30s-latency.md`. New resident runs interpret context buckets as total sequence budgets and reserve output inside them.
 
-`doctor` only approves an acceptance-grade baseline when it sees an RTX 5090 with at least 30,000 MiB, a committed Qwasar revision, an existing model path, and an artifact hash equal to the frozen manifest pin. The EXL3 5 bpw shards and tokenizer are verified, and the local artifact tree hash is now pinned. No Qwasar commit has been created.
+`doctor` only approves an acceptance-grade baseline when it sees an RTX 5090 with at least 30,000 MiB, a committed Qwarz revision, an existing model path, and an artifact hash equal to the frozen manifest pin. The EXL3 5 bpw shards and tokenizer are verified, and the local artifact tree hash is now pinned. No Qwarz commit has been created.
 
 The 3.5 bpw profile uses `--qualification bringup`. It can exercise the API, persistent turns, long-context allocation, cancellation, recovery, and optimization plumbing before 5 bpw is ready. It is structurally prevented from becoming an acceptance baseline because `doctor` requires 4.5–5.0 bpw for `acceptance`.
 
@@ -237,9 +261,9 @@ Exit code `0` means success, `2` means invalid input or an environment that cann
 
 ## Current Baseline Blockers
 
-- The local ExLlamaV3 server at `../qwen38-exl3-mia` exposes `/v1/chat/completions`. Use `--protocol chat-completions`; Qwasar reconstructs `previous_response_id` history locally and derives usage from the donor's single-user `/health` counters. This bridge records TTFT but does not mislabel it as model-internal prefill time.
+- The local ExLlamaV3 server at `../qwen38-exl3-mia` exposes `/v1/chat/completions`. Use `--protocol chat-completions`; Qwarz reconstructs `previous_response_id` history locally and derives usage from the donor's single-user `/health` counters. This bridge records TTFT but does not mislabel it as model-internal prefill time.
 - The approved target source is pinned to [`thelastspark/Qwen3.8-27B-exl3`](https://huggingface.co/thelastspark/Qwen3.8-27B-exl3/tree/5.00bpw), revision `1a6fe4afb5b921fda9f93fd4b06d6c6d5c99a62c`. Its three shards total 19.9 GB and pass their expected SHA-256 checks. The local tree hash is `0b9a439ffefa45c55a2a3cb0324de9fe1b23bce69a37a399cb952d355f02d92e`.
 - The host exposes an RTX 5090 (`sm_120`) and a 3090 Ti. The former 3.5 bpw HTTP service on GPU 0 was intentionally stopped for the direct resident-session experiment; launchers must still reject an unrelated inference workload on the selected GPU.
-- Qwasar has no commit yet, by policy. `doctor` intentionally rejects acceptance-grade collection until an engine revision and the final local target hash are frozen.
+- Qwarz has no commit yet, by policy. `doctor` intentionally rejects acceptance-grade collection until an engine revision and the final local target hash are frozen.
 
 The approved architecture is in `docs/superpowers/specs/2026-09-04-qwen38-27b-rtx5090-engine-design.md`. The active M1 experiment plan is in `docs/superpowers/plans/2026-09-04-m1-resident-session-experiment.md`.
