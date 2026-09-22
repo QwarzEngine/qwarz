@@ -337,6 +337,19 @@ in `/health` as `worker.config` (`decode_attention`, `target_cache`,
 `integrations/systemd/qwasar.service`, `daemon-reload`, restart. See the
 [rendezvous campaign](../results/20260920-rendezvous/report.md).
 
+Since 2026-09-22 the MTP **proposer** also runs on a 65536-token head
+(512 Hadamard groups recalibrated over the full matrix corpus, pinned by
+hash in the session identity) while the verifier keeps the full 248320-row
+head. Measured on the production stack, same day, rendezvous on both arms:
+−2.4 to −2.5 ms/verify of draft weight reads at every context, decode
++5% @32K / +17% @64K / +16% @128K / +6.5% @256K, TTFT par, +0.24 GB VRAM;
+the 37-cell gate passed 4/4 (coding 20/32 vs 19/32, json 4/4, acceptance
+−2.1 pp, memory +0.24 GiB). `QWASAR_HOT64K=0` boots the full proposer head
+instead; a failed install also degrades to it (with a different session
+identity, reported in `/health` as `mtp_head`). Swapping the head
+invalidates previous session snapshots. See the
+[hot64k campaign](../results/20260922-hot64k-xqa/report.md).
+
 ## Verification
 
 For rejected tool-call capture and CPU-only replay, see

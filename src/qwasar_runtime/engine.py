@@ -10,7 +10,7 @@ import re
 import time
 from types import SimpleNamespace
 
-from . import diagnostics, rendezvous, vision
+from . import diagnostics, hot_head, rendezvous, vision
 from .parsing import SchemaValidationError, StreamParser, canonical, image_parts, message_key, validate_messages, validate_tools
 from .rendering import REASONING_CLOSE, Prompt, encode, render
 
@@ -638,7 +638,10 @@ class ExLlamaBackend:
         if donor is not None:
             identity_body["mlp_donor_revision"] = donor["revision"]
             identity_body["mlp_donor_shards"] = {name: info["sha256"] for name, info in donor["shards"].items()}
-        self.identity = hashlib.sha256(canonical(identity_body).encode()).hexdigest()
+        # The identity is finalized after the load: the MTP proposer head
+        # changes the proposal distribution, so a boot that degrades to the
+        # full head must not reuse snapshots written by the hot-head identity
+        # (or vice versa).
         self._lifetime = ExitStack()
         try:
             if xqa is not None:
@@ -695,9 +698,26 @@ class ExLlamaBackend:
             # The vision tower stays EXL3/BF16 and loads after the NVIDIA MLP swap so the
             # donor replacement count (192 text MLPs) is unaffected by model.visual.* modules.
             self.vision = vision.VisionRuntime(self.generator, self.tokenizer)
+            # MTP proposer head of 65536 tokens (recalibrated map, promoted
+            # 2026-09-22). Installs after vision so a tight VRAM boot prefers
+            # failing this optional head over the required vision tables. The
+            # install verifies the map hash and the bit-exact group
+            # reconstruction and never breaks the boot: on any failure the
+            # service serves with the full proposer head (and a matching,
+            # different session identity). QWASAR_HOT64K=0 disables it.
+            self._hot_head = {"installed": False, "disabled": True}
+            if hot_head.enabled():
+                try:
+                    self._hot_head = {"installed": True, **hot_head.install(self.generator)}
+                except Exception:
+                    self._hot_head = {"installed": False, "error": True}
         except Exception:
             self._lifetime.close()
             raise
+        if self._hot_head.get("installed"):
+            identity_body["mtp_proposer_head"] = {"revision": hot_head.REVISION,
+                                                  "map_sha256": hot_head.MAP_SHA256}
+        self.identity = hashlib.sha256(canonical(identity_body).encode()).hexdigest()
         self.end_token = encode(self.tokenizer, "<|im_end|>")[0]
         self.draft_tokens = self.generator.num_draft_tokens
         self.prefill = prefill
@@ -717,7 +737,8 @@ class ExLlamaBackend:
             "xqa_adapter_revision": xqa.REVISION if xqa is not None else None,
             "target_cache": ("NVFP4 one-level (global scale 1, page 256)" if xqa is not None else "K8/V4"),
             "mlp_graphs": hybrid.EXPECTED_GRAPHS if hybrid else 0,
-            "rendezvous": self._rendezvous}
+            "rendezvous": self._rendezvous,
+            "mtp_head": self._hot_head}
 
     def start(self, tokens, request):
         import torch

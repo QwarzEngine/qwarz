@@ -12,13 +12,15 @@ owns the GPU.
 ## The stack
 
 Every lever is measured against a same-day control before it ships. The
-production stack (`--prefill xqa`, promoted 2026-09-21 after a 37-cell gate):
+production stack (`--prefill xqa`, promoted 2026-09-21 after a 37-cell gate;
+MTP proposer head 64K added 2026-09-22 after its own 37-cell gate):
 
 | lever | effect |
 |---|---|
 | EXL3 5.0 bpw artifact | pinned model quantization, hash-verified at every load |
 | NVIDIA64 NVFP4 MLP donor | 192 FP4/FP8 matrices + MLP CUDA graphs |
 | MTP6 speculative decoding | 6 fixed draft proposals, ~0.70 acceptance on coding |
+| MTP proposer head 64K | 65536-token draft head (recalibrated map, pinned hash): −2.5 ms/verify of draft weight reads |
 | NVFP4 one-level KV cache | quantized KV (page 256) compresses deep-context reads |
 | XQA decode attention | decode kernels + per-layer decode CUDA graphs |
 | PRIMS FP8 prefill | large prefills (≥8K) |
@@ -55,9 +57,23 @@ NVFP4 touches only those 192 MLP weights — not attention, embeddings,
 `lm_head`, MTP or vision. The KV cache is a separate quantization axis
 (K8/V4 on `flash`, NVFP4 one-level on `xqa`).
 
+### The MTP proposer head
+
+The MTP **proposer** runs on a 65536-token head (512 complete 128-token
+Hadamard groups, 6 bpw) rebuilt from the pinned full head at every load; the
+**verifier keeps the full 248320-row head**, so an id outside the map merely
+stops being proposable. The map is frequency-calibrated over the full
+37-cell matrix corpus (99.6% group coverage) and pinned by SHA-256 in the
+session identity; the engine refuses it unless the 512 groups reconstruct
+bit-exactly from the full head. Cost: +0.24 GB VRAM; effect: a constant
+−2.5 ms/verify of draft weight reads at every context. If the install fails
+at boot the service degrades to the full proposer head with a matching
+(different) session identity, reported in `/health` as `mtp_head`.
+
 Rollback to the pre-XQA stack: `--prefill flash` in
 `integrations/systemd/qwasar.service`, `daemon-reload`, restart.
-`QWASAR_RDZ=0` disables the rendezvous path at boot.
+`QWASAR_RDZ=0` disables the rendezvous path at boot; `QWASAR_HOT64K=0`
+disables the 64K proposer head (full 248320-token proposer) at boot.
 
 Pinned artifact: `thelastspark/Qwen3.8-27B-exl3` @
 `1a6fe4afb5b921fda9f93fd4b06d6c6d5c99a62c`, three shards, 19.9 GB, SHA-256
@@ -67,26 +83,31 @@ requires re-pinning and re-validating.
 
 ## Expected numbers
 
-Measured samples (2026-09-21, production stack, protocol cells, single user,
-batch 1), not an SLA. Per-cell run noise: ±5% decode, ±2–3 pp acceptance.
+Measured samples (2026-09-22, production stack with the 64K proposer head,
+37-cell matrix medians, single user, batch 1), not an SLA. Per-cell run
+noise: ±5% decode, ±2–3 pp acceptance.
 
 | context | decode (tok/s) | TTFT |
 |---|---:|---:|
-| 4K | 248 | 0.67 s |
-| 32K | 220 | 5.1 s |
-| 64K | 199 | 11.3 s |
-| 128K | 191 | 26.4 s |
-| 256K | 163 | 67.0 s |
+| 4K | 283 | 0.63 s |
+| 32K | 230 | 5.1 s |
+| 64K | 232 | 11.1 s |
+| 128K | 207 | 26.3 s |
+| 256K | 174 | 66.6 s |
 
 - Warm short chat end-to-end: ~156 tok/s decode, TTFT 70–140 ms warm (~1.1 s cold).
 - Large prefills (PRIMS path): 5,300–6,800 tok/s.
 - MTP acceptance ~0.62–0.70, workload dependent; decode tracks it.
-- VRAM: ~28.7 of 32.6 GB resident (~3.4 GB free).
-- Quality gate (frozen checkers): 24/32 coding cells + 4/4 json vs control 23/32.
+- VRAM: ~27.9 of 32.6 GB peak (~4.5 GB free).
+- Quality gate (frozen checkers): 20/32 coding cells + 4/4 json vs control
+  19/32 (same-day, both arms with rendezvous).
 
 Upgrade deltas vs the previous flash stack (same-day A/B): decode +35% @32K,
-+47% @256K, TTFT −3–4%, acceptance and quality not worse. Full stats and
-methodology: `results/20260920-rendezvous/community-stats.md` (local artifact).
++47% @256K, TTFT −3–4%, acceptance and quality not worse. The 64K proposer
+head adds +5% @32K, +17% @64K, +16% @128K, +6.5% @256K on top, TTFT par,
+acceptance −2.1 pp (gate ±5). Full stats and methodology:
+`results/20260920-rendezvous/community-stats.md` and
+`results/20260922-hot64k-xqa/report.md` (local artifacts).
 
 ## Use it
 
