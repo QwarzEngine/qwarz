@@ -1,5 +1,5 @@
 [Unit]
-Description=Qwasar Qwen3.8-27B EXL3 + NVIDIA64 + Flash/PRIMS + MTP6 + K8/V4 (RTX 5090)
+Description=Qwasar Qwen3.8-27B EXL3 + NVIDIA64 + XQA/PRIMS + MTP6 + NVFP4-KV (RTX 5090)
 StartLimitIntervalSec=0
 
 [Service]
@@ -12,7 +12,7 @@ Environment="QWASAR_MODEL_PATH=%h/models/Qwen3.8-27B-EXL3-5.0bpw"
 Environment="QWASAR_EXLLAMA_PYTHON=%h/Documents/llm/qwen38-exl3-mia/.venv/bin/python"
 Environment="HF_HUB_OFFLINE=1"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py serve --prefill flash
+ExecStart=/usr/bin/python3 %h/Documents/llm/qwarz/scripts/qwasar.py serve --prefill xqa
 ExecStartPost=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py wait-ready --pid ${MAINPID}
 Restart=on-failure
 RestartSec=15

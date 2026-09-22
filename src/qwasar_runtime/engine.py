@@ -10,7 +10,7 @@ import re
 import time
 from types import SimpleNamespace
 
-from . import diagnostics, vision
+from . import diagnostics, rendezvous, vision
 from .parsing import SchemaValidationError, StreamParser, canonical, image_parts, message_key, validate_messages, validate_tools
 from .rendering import REASONING_CLOSE, Prompt, encode, render
 
@@ -25,6 +25,42 @@ def reasoning_token_cap(thinking, max_tokens, override=None):
     budget = REASONING_BUDGETS[thinking] if override is None else override
     reserve = min(CONTENT_RESERVE, max(0, max_tokens // 2))
     return min(budget, max(0, max_tokens - reserve))
+
+
+def incomplete_reason_from_error(error, final):
+    """Classifies a turn that ended with a rejected tool call or open reasoning.
+
+    Only an actual output-budget stop may look like truncation to a client;
+    agent harnesses treat `finish_reason: "length"` as context pressure and
+    start compaction loops, so a parse failure must stay distinguishable.
+    """
+    if final is not None and final.get("eos_reason") == "max_new_tokens":
+        return "max_new_tokens"
+    message = str(error)
+    if isinstance(error, SchemaValidationError) or message.startswith("invalid JSON value"):
+        return "invalid_tool_arguments"
+    if "undeclared or prohibited" in message:
+        return "undeclared_tool"
+    if "does not match tool_choice" in message:
+        return "tool_choice_mismatch"
+    if "required tool call was not generated" in message:
+        return "missing_tool_call"
+    if "malformed" in message:
+        return "malformed_tool_call"
+    if "reasoning" in message:
+        return "unterminated_reasoning"
+    return "tool_call_error"
+
+
+def tool_error_summary(evidence):
+    """Bounded, value-free view of rejected tool-call evidence for API metrics."""
+    if not isinstance(evidence, dict):
+        return None
+    summary = {key: evidence[key] for key in ("stage", "tool", "call_index") if evidence.get(key) is not None}
+    error = evidence.get("error")
+    if isinstance(error, dict):
+        summary["error"] = error.get("message") or error.get("class")
+    return summary or None
 
 
 class RequestError(ValueError):
@@ -69,7 +105,7 @@ class Engine:
         thinking = request.setdefault("thinking", "medium")
         if thinking not in ("off", "low", "medium", "xhigh"):
             raise RequestError("thinking must be off, low, medium, or xhigh")
-        maximum = request.setdefault("max_tokens", 4096)
+        maximum = request.setdefault("max_tokens", 32768)
         if type(maximum) is not int or maximum <= 0:
             raise RequestError("max_tokens must be a positive integer")
         for name, default, low, high in (("temperature", 0.7 if thinking == "off" else 1.0, 0, 2),
@@ -144,7 +180,11 @@ class Engine:
             return {}
         if not self.backend.config.get("vision"):
             raise RequestError("this runtime does not accept images")
-        if len(parts) > vision.MAX_IMAGES:
+        unique = []
+        for part in parts:
+            if part["sha256"] not in unique:
+                unique.append(part["sha256"])
+        if len(unique) > vision.MAX_IMAGES:
             raise RequestError(f"at most {vision.MAX_IMAGES} images per request")
         supplied = supplied if isinstance(supplied, dict) else {}
         embeddings = {}
@@ -178,6 +218,8 @@ class Engine:
         tape = list(prompt.tokens)
         reasoning_tokens = 0
         close_reason = None
+        incomplete_reason = None
+        tool_error = None
         reasoning_cap = prompt.request.get("_reasoning_cap", 0)
         try:
             if status != "cancelled":
@@ -231,6 +273,7 @@ class Engine:
                                 stopped = True
                                 if leftover <= 0:
                                     status = "incomplete"
+                                    incomplete_reason = "reasoning_budget"
                                     final = {"eos": True, "eos_reason": "max_new_tokens",
                                              "new_tokens": len(tape) - len(prompt.tokens), "synthetic": True}
                                     break
@@ -254,21 +297,29 @@ class Engine:
                     if sequence[:len(prompt.tokens)] != prompt.tokens:
                         raise RuntimeError("generator changed the exact prompt token tape")
                 if status != "incomplete":
-                    status = "incomplete" if final.get("eos_reason") == "max_new_tokens" else "completed"
+                    if final.get("eos_reason") == "max_new_tokens":
+                        status, incomplete_reason = "incomplete", "max_new_tokens"
+                    else:
+                        status = "completed"
                 if status == "completed" and sequence[-1] != self.backend.end_token:
                     raise ValueError("generation has no actual native im_end terminator")
                 if status == "completed" and parser.channel == "reasoning":
-                    status = "incomplete"
+                    status, incomplete_reason = "incomplete", "unterminated_reasoning"
                 if parser.in_tools and parser.unclosed_tool_xml():
                     status = "incomplete"
-                    self._capture_incomplete_tools(parser, response_id, prompt)
+                    if incomplete_reason is None:
+                        incomplete_reason = ("max_new_tokens" if final.get("eos_reason") == "max_new_tokens"
+                                             else "unclosed_tool_call")
+                    tool_error = self._capture_incomplete_tools(parser, response_id, prompt)
             try:
                 message = parser.finish(complete=status == "completed")
             except (SchemaValidationError, ValueError) as error:
                 if not parser.in_tools and "reasoning" not in str(error):
                     raise
                 status = "incomplete"
-                self._capture_incomplete_tools(parser, response_id, prompt, error)
+                if incomplete_reason is None:
+                    incomplete_reason = incomplete_reason_from_error(error, final)
+                tool_error = self._capture_incomplete_tools(parser, response_id, prompt, error)
                 message = parser.finish(complete=False)
             for channel, field in (("content", "content"), ("reasoning", "reasoning_content")):
                 tail = message[field][streamed_characters[channel]:]
@@ -318,6 +369,8 @@ class Engine:
             "finish_reason": final.get("eos_reason") if final else "cancelled",
             "reasoning_closed": close_reason,
             "reasoning_tokens": reasoning_tokens,
+            "incomplete_reason": incomplete_reason,
+            "tool_error": tool_error_summary(tool_error),
         }
         snapshot = None
         if status == "completed":
@@ -332,11 +385,16 @@ class Engine:
                "metrics": metrics, "snapshot": snapshot, "error": None}
 
     def _capture_incomplete_tools(self, parser, response_id, prompt, error=None):
+        """Persists rejected tool-call evidence and returns it for the terminal metrics.
+
+        The returned evidence stays in memory only; `tool_error_summary` decides
+        what (bounded, value-free) part becomes part of the API response.
+        """
         evidence = parser.tool_diagnostic or ({"raw_tool_calls": parser.xml, "tool_schemas": parser.functions,
             "tool": None, "parsed_arguments": {}, "stage": "incomplete_native_parse", "call_index": 0}
             if parser.xml else None)
-        if evidence is None or self.diagnostic_directory is None:
-            return
+        if evidence is None:
+            return None
         evidence = {**evidence, "response_id": response_id, "runtime_identity": self.backend.identity,
                     "parser_sha256": self.parser_sha256, "thinking": prompt.request["thinking"],
                     "tool_choice": prompt.request["tool_choice"]}
@@ -345,10 +403,12 @@ class Engine:
         if isinstance(error, SchemaValidationError):
             evidence["validation"] = {"path": error.path, "expected_type": error.expected_type,
                                       "actual_type": error.actual_type}
-        try:
-            diagnostics.save_diagnostic(self.diagnostic_directory, evidence)
-        except Exception:
-            pass
+        if self.diagnostic_directory is not None:
+            try:
+                diagnostics.save_diagnostic(self.diagnostic_directory, evidence)
+            except Exception:
+                pass
+        return evidence
 
 
 class FakeTokenizer:
@@ -431,6 +491,19 @@ class FakeBackend:
             if "[fake:truncated-tool]" in latest and tools:
                 name = tools[0]["function"]["name"]
                 response = "<tool_call><function=" + name + "><parameter=x>cut"
+            if "[fake:undeclared-tool]" in latest and tools:
+                response = ("<tool_call>\n<function=" + tools[0]["function"]["name"] + "_missing>\n"
+                            "<parameter=url>\nhttp://127.0.0.1/\n</parameter>\n</function>\n</tool_call>")
+            if "[fake:bad-args]" in latest and tools:
+                name = tools[0]["function"]["name"]
+                response = ("<tool_call>\n<function=" + name + ">\n<parameter=duplicated>\n1\n</parameter>\n"
+                            "<parameter=duplicated>\n2\n</parameter>\n</function>\n</tool_call>")
+            if "[fake:hermes-bool]" in latest and tools:
+                name = tools[0]["function"]["name"]
+                response = ("<tool_call>\n<function=" + name + ">\n"
+                            "<parameter=background>\nTrue\n</parameter>\n"
+                            "<parameter=command>\necho ok\n</parameter>\n"
+                            "</function>\n</tool_call>")
             if request["thinking"] != "off":
                 response = "Fake reasoning.</think>\n\n" + response
         self.chunks = list(response)
@@ -536,22 +609,55 @@ class ExLlamaBackend:
             runtime_hash.update(source.read_bytes())
         hybrid = None
         donor = None
+        xqa = None
         if prefill == "flash":
             from . import hybrid as hybrid_mod
             hybrid_mod.prepare_environment()
             donor = hybrid_mod.verify_donor()
             hybrid_mod.install_prims()
             hybrid = hybrid_mod
+        elif prefill == "xqa":
+            # Promoted F4b candidate (2026-09-21): XQA decode + NVFP4 one-level
+            # target cache + per-layer decode graphs, PRIMS prefill route.
+            # Same donor/PRIMS machinery as flash, plus the NVFP4/XQA adapter.
+            from . import hybrid as hybrid_mod
+            from . import xqa as xqa_mod
+            hybrid_mod.prepare_environment()
+            donor = hybrid_mod.verify_donor()
+            hybrid_mod.install_prims()
+            import flashinfer
+            hybrid = hybrid_mod
+            xqa = xqa_mod
+            self._xqa_flashinfer = flashinfer
         identity_body = {"model": str(model_path), "files": hashes,
             "artifact_sha256": artifact_sha256, "runtime": runtime_hash.hexdigest(),
             "renderer_abi": 2, "quantization": hybrid.QUANTIZATION if hybrid else "5bpw-K8V4-MTP"}
+        if xqa is not None:
+            identity_body["decode_attention"] = "xqa"
+            identity_body["xqa_adapter_revision"] = xqa.REVISION
         if donor is not None:
             identity_body["mlp_donor_revision"] = donor["revision"]
             identity_body["mlp_donor_shards"] = {name: info["sha256"] for name, info in donor["shards"].items()}
         self.identity = hashlib.sha256(canonical(identity_body).encode()).hexdigest()
         self._lifetime = ExitStack()
         try:
-            if hybrid is not None:
+            if xqa is not None:
+                adapter = self._lifetime.enter_context(
+                    xqa.install("nvfp4-xqa", self._xqa_flashinfer, "prims"))
+                self._xqa_adapter = adapter
+                self._lifetime.enter_context(hybrid.attention_context())
+                with hybrid.replace_mlps() as replaced:
+                    with xqa.draft_k8v4() as cache_calls:
+                        self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
+                            model_path=model_path, draft_model_path=model_path, cache_size=context_size,
+                            cache_quant="nvfp4", gpu_split_gb=gpu_split_gb, draft_method="mtp", num_draft_tokens=6)
+                    if len(replaced) != hybrid.EXPECTED_MLP:
+                        raise ValueError(f"expected {hybrid.EXPECTED_MLP} NVIDIA MLP replacements, got {len(replaced)}")
+                graphed = hybrid.graph_mlps(self.generator.model)
+                if len(graphed) != hybrid.EXPECTED_GRAPHS:
+                    raise ValueError(f"expected {hybrid.EXPECTED_GRAPHS} NVIDIA MLP graphs, got {len(graphed)}")
+                self._xqa_caches = xqa.validate_caches(self.generator)
+            elif hybrid is not None:
                 self._lifetime.enter_context(hybrid.attention_context())
                 with hybrid.replace_mlps() as replaced:
                     self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
@@ -566,6 +672,26 @@ class ExLlamaBackend:
                 self.generator, self.tokenizer, _ = _load_exllamav3_runtime(
                     model_path=model_path, draft_model_path=model_path, cache_size=context_size,
                     cache_quant="8,4", gpu_split_gb=gpu_split_gb, draft_method="mtp", num_draft_tokens=6)
+            # Rendezvous fast paths (batched verify window, GPU-chained MTP draft
+            # walk, shared embedding on GPU). Optional acceleration with
+            # all-or-nothing per-batch fallbacks; QWASAR_RDZ=0 disables the
+            # whole path, QWASAR_RDZ_EMB=0 keeps the embedding on CPU. The
+            # install never breaks the boot: on any failure the service runs
+            # the stock paths.
+            self._rendezvous = {}
+            if rendezvous.ENABLED:
+                try:
+                    gpu_embedding = os.environ.get("QWASAR_RDZ_EMB", "1") != "0"
+                    rendezvous.install(self.generator, gpu_embedding=gpu_embedding)
+                    counters = rendezvous.diagnostics()["counters"]
+                    self._rendezvous = {
+                        "installed": True,
+                        "gpu_embedding": gpu_embedding and counters.get("emb_moved", 0) > 0,
+                    }
+                except Exception:
+                    self._rendezvous = {"installed": False, "error": True}
+            else:
+                self._rendezvous = {"installed": False, "disabled": True}
             # The vision tower stays EXL3/BF16 and loads after the NVIDIA MLP swap so the
             # donor replacement count (192 text MLPs) is unaffected by model.visual.* modules.
             self.vision = vision.VisionRuntime(self.generator, self.tokenizer)
@@ -585,8 +711,13 @@ class ExLlamaBackend:
             "mlp_donor": donor["revision"] if donor else None,
             "mlp_donor_path": donor["path"] if donor else None,
             "fp8_prims": hybrid is not None, "prims_min_query": hybrid.PRIMS_MIN_QUERY if hybrid else None,
-            "p_scale": hybrid.P_SCALE if hybrid else None, "attention64": hybrid is not None,
-            "mlp_graphs": hybrid.EXPECTED_GRAPHS if hybrid else 0}
+            "p_scale": hybrid.P_SCALE if hybrid else None,
+            "attention64": hybrid is not None and xqa is None,
+            "decode_attention": "xqa" if xqa is not None else ("flash-attn64" if hybrid is not None else "stock"),
+            "xqa_adapter_revision": xqa.REVISION if xqa is not None else None,
+            "target_cache": ("NVFP4 one-level (global scale 1, page 256)" if xqa is not None else "K8/V4"),
+            "mlp_graphs": hybrid.EXPECTED_GRAPHS if hybrid else 0,
+            "rendezvous": self._rendezvous}
 
     def start(self, tokens, request):
         import torch
@@ -608,7 +739,8 @@ class ExLlamaBackend:
         from qwasar_bench.prefill_tuning import workload_tuning_context
 
         settings = {"name": "flash_chunk8192", "implementation": "torch_flash", "staging": 1,
-                    "minimum_query": 17, "chunk_size": 8192, "kwargs": {}} if self.prefill == "flash" else None
+                    "minimum_query": 17, "chunk_size": 8192, "kwargs": {}} \
+            if self.prefill in ("flash", "xqa") else None
         return workload_tuning_context(self.generator, settings)
 
     def remaining(self):

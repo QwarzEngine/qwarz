@@ -1,0 +1,7 @@
+# Profile: Qwarz local Responses API. Use: codex -p qwasar
+model_provider = "qwasar"
+model = "qwasar-qwen38-27b"
+model_reasoning_effort = "high"
+model_context_window = 262144
+model_catalog_json = "CATALOG_JSON"
+approvals_reviewer = "user"

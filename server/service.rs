@@ -1,9 +1,17 @@
 use crate::{
+    anthropic::{self, AnthropicStream},
     api,
     store::Store,
     stream::ResponsesStream,
     worker::{Worker, WorkerConfig},
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    Chat,
+    Responses,
+    Anthropic,
+}
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -37,6 +45,8 @@ pub fn router(app: App) -> Router {
         .route("/v1/models", get(models))
         .route("/config", get(config))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/{id}", get(retrieve))
         .route("/v1/responses/{id}/cancel", post(cancel))
@@ -87,14 +97,30 @@ async fn cancel(State(app): State<App>, Path(id): Path<String>) -> Response {
     }
 }
 async fn chat(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    generate(app, headers, body, false).await
+    generate(app, headers, body, Wire::Chat).await
 }
 async fn responses(
     State(app): State<App>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    generate(app, headers, body, true).await
+    generate(app, headers, body, Wire::Responses).await
+}
+async fn messages(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    generate(app, headers, body, Wire::Anthropic).await
+}
+async fn count_tokens(Json(body): Json<Value>) -> Response {
+    match anthropic::count_tokens(&body) {
+        Ok(tokens) => Json(json!({"input_tokens": tokens})).into_response(),
+        Err(detail) => anthropic::http_error(400, "invalid_request", &detail),
+    }
+}
+fn fail(wire: Wire, status: u16, code: &str, message: &str) -> Response {
+    if wire == Wire::Anthropic {
+        anthropic::http_error(status, code, message)
+    } else {
+        error(status, code, message)
+    }
 }
 
 struct ClientStream {
@@ -123,22 +149,27 @@ async fn send_frame(sender: &mpsc::Sender<Result<Bytes, std::io::Error>>, frame:
     )
 }
 
-async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) -> Response {
+async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Response {
+    let responses = wire == Wire::Responses;
     let explicit_parent = match body.get("previous_response_id") {
-        Some(parent) => match parent.as_str() {
+        Some(parent) if responses => match parent.as_str() {
             Some(id) => match app.store.parent(id) {
                 Ok(snapshot) => Some(snapshot),
-                Err(detail) => return error(400, "invalid_parent", &detail),
+                Err(detail) => return fail(wire, 400, "invalid_parent", &detail),
             },
-            None => return error(400, "invalid_parent", "previous_response_id must be string"),
+            None => return fail(wire, 400, "invalid_parent", "previous_response_id must be string"),
         },
-        None => None,
+        _ => None,
     };
-    let mut request = match api::prepare(&body, responses, explicit_parent.as_ref()) {
+    let request = match wire {
+        Wire::Anthropic => anthropic::prepare(&body),
+        Wire::Chat | Wire::Responses => api::prepare(&body, responses, explicit_parent.as_ref()),
+    };
+    let mut request = match request {
         Ok(request) => request,
-        Err(detail) => return error(400, "invalid_request", &detail),
+        Err(detail) => return fail(wire, 400, "invalid_request", &detail),
     };
-    if let Err(response) = resolve_images(&app, &mut request) {
+    if let Err(response) = resolve_images(&app, &mut request, wire) {
         return response;
     }
     let body = if request.get("images").is_some() {
@@ -154,7 +185,8 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         .as_ref()
         .is_some_and(|key| key.is_empty() || key.len() > 256)
     {
-        return error(
+        return fail(
+            wire,
             400,
             "invalid_idempotency_key",
             "key must contain 1..256 bytes",
@@ -164,23 +196,24 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         match app.store.idempotent(key) {
             Ok(Some((_id, previous, result))) => {
                 if previous != body {
-                    return error(
+                    return fail(
+                        wire,
                         409,
                         "idempotency_conflict",
                         "key already belongs to another request",
                     );
                 }
                 if result["status"] == "in_progress" {
-                    return error(409, "busy", "original request still running");
+                    return fail(wire, 409, "busy", "original request still running");
                 }
                 return replay_result(
                     result,
-                    responses,
+                    wire,
                     body["stream"] == true,
                     body["stream_options"]["include_usage"] != false,
                 );
             }
-            Err(detail) => return error(500, "storage_error", &detail),
+            Err(detail) => return fail(wire, 500, "storage_error", &detail),
             _ => {}
         }
     }
@@ -193,16 +226,19 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         {
             Ok(parent) => parent,
             Err(detail) if detail.starts_with("ambiguous history") => {
-                return error(400, "ambiguous_history", &detail);
+                return fail(wire, 400, "ambiguous_history", &detail);
             }
-            Err(detail) => return error(500, "storage_error", &detail),
+            Err(detail) => return fail(wire, 500, "storage_error", &detail),
         }
     };
-    let id = api::new_id("resp");
+    let id = api::new_id(if wire == Wire::Anthropic { "msg" } else { "resp" });
+    let requested_model = body["model"].as_str().unwrap_or(api::MODEL).to_string();
+    let stream_model = requested_model.clone();
     let mut events = match app.worker.start(&id, request, parent).await {
         Ok(receiver) => receiver,
         Err(detail) => {
-            return error(
+            return fail(
+                wire,
                 if detail == "busy" { 409 } else { 503 },
                 "worker_unavailable",
                 &detail,
@@ -215,7 +251,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
             app.worker.release(&id);
             drop(events);
         });
-        return error(500, "storage_error", &detail);
+        return fail(wire, 500, "storage_error", &detail);
     }
     let streaming = body["stream"] == true;
     let include_usage = body["stream_options"]["include_usage"] != false;
@@ -226,6 +262,8 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
     tokio::spawn(async move {
         let mut ready_sender = Some(ready_sender);
         let mut response_stream = ResponsesStream::new(&id);
+        let mut anthropic_stream = AnthropicStream::new(&id, &stream_model);
+        let named = matches!(wire, Wire::Responses | Wire::Anthropic);
         let mut deadline = Instant::now() + app.worker.request_timeout;
         let mut cancellation_deadline = None;
         let mut forced_failure = None;
@@ -289,29 +327,38 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
                     let _ = sender.send(Ok(()));
                 }
                 if streaming {
-                    frames.push(if responses {
-                        response_stream.created()
-                    } else {
-                        api::chat_chunk(&id, json!({"role":"assistant"}), Value::Null)
+                    frames.push(match wire {
+                        Wire::Responses => response_stream.created(),
+                        Wire::Anthropic => anthropic_stream
+                            .started(event["prompt_tokens"].as_u64().unwrap_or(0)),
+                        Wire::Chat => {
+                            api::chat_chunk(&id, json!({"role":"assistant"}), Value::Null)
+                        }
                     });
                 }
             }
             if event["type"] == "delta" && streaming {
-                if responses {
-                    frames = response_stream.delta(event["channel"] == "reasoning", &event["text"]);
-                } else {
-                    let mut delta = json!({});
-                    delta[if event["channel"] == "reasoning" {
-                        "reasoning_content"
-                    } else {
-                        "content"
-                    }] = event["text"].clone();
-                    frames.push(api::chat_chunk(&id, delta, Value::Null));
-                }
+                frames = match wire {
+                    Wire::Responses => {
+                        response_stream.delta(event["channel"] == "reasoning", &event["text"])
+                    }
+                    Wire::Anthropic => {
+                        anthropic_stream.delta(event["channel"] == "reasoning", &event["text"])
+                    }
+                    Wire::Chat => {
+                        let mut delta = json!({});
+                        delta[if event["channel"] == "reasoning" {
+                            "reasoning_content"
+                        } else {
+                            "content"
+                        }] = event["text"].clone();
+                        vec![api::chat_chunk(&id, delta, Value::Null)]
+                    }
+                };
             }
             if frames
                 .iter()
-                .any(|value| output_sender.try_send(Ok(sse(value, responses))).is_err())
+                .any(|value| output_sender.try_send(Ok(sse(value, named))).is_err())
             {
                 forced_failure = Some(failure(
                     &id,
@@ -325,8 +372,9 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         }
         terminal["created_at"] = json!(api::now());
         let mut response = response_stream.ordered_response(api::response_result(&id, &terminal));
+        let anthropic_message = anthropic::result(&id, &stream_model, &terminal);
         let status = terminal["status"].as_str().unwrap_or("failed");
-        let stored = json!({"id":id,"status":status,"response":response,"chat":api::chat_result(&id,&terminal)});
+        let stored = json!({"id":id,"status":status,"response":response,"chat":api::chat_result(&id,&terminal),"anthropic":anthropic_message});
         if let Err(detail) = app.store.finish(
             &id,
             status,
@@ -335,7 +383,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
         ) {
             terminal = json!({"status":"failed","error":{"code":"storage_error","message":detail,"http_status":500}});
             response = api::response_result(&id, &terminal);
-            let failed = json!({"id":id,"status":"failed","response":response,"chat":api::chat_result(&id,&terminal)});
+            let failed = json!({"id":id,"status":"failed","response":response,"chat":api::chat_result(&id,&terminal),"anthropic":anthropic::result(&id,&stream_model,&terminal)});
             let _ = app.store.finish(&id, "failed", &failed, None);
         }
         app.worker.release(&id);
@@ -351,6 +399,20 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
                         .iter()
                         .map(|event| sse(event, true)),
                 );
+            } else if wire == Wire::Anthropic {
+                if matches!(terminal["status"].as_str(), Some("failed" | "cancelled")) {
+                    frames.push(sse(
+                        &json!({"type":"error","error":{"type":"api_error","message":terminal["error"]["message"].as_str().unwrap_or("generation cancelled")}}),
+                        true,
+                    ));
+                } else {
+                    frames.extend(
+                        anthropic_stream
+                            .finish(&anthropic::result(&id, &stream_model, &terminal))
+                            .iter()
+                            .map(|event| sse(event, true)),
+                    );
+                }
             } else if matches!(terminal["status"].as_str(), Some("failed" | "cancelled")) {
                 frames.push(sse(&json!({"error":terminal.get("error").filter(|value|!value.is_null()).cloned().unwrap_or(json!({"code":"cancelled","message":"generation cancelled"})),"id":id}),false));
             } else {
@@ -372,7 +434,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
                     frames.push(sse(&json!({"id":id,"object":"chat.completion.chunk","created":api::now(),"model":api::MODEL,"choices":[],"usage":terminal["usage"],"qwasar_metrics":terminal["metrics"]}),false));
                 }
             }
-            if !responses {
+            if wire == Wire::Chat {
                 frames.push(Bytes::from_static(b"data: [DONE]\n\n"));
             }
             for frame in frames {
@@ -386,7 +448,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
     match ready_receiver.await {
         Ok(Ok(())) => {}
         Ok(Err(terminal)) => return terminal_error(&terminal),
-        Err(_) => return error(503, "worker_lost", "generation task ended unexpectedly"),
+        Err(_) => return fail(wire, 503, "worker_lost", "generation task ended unexpectedly"),
     }
     if streaming {
         return Response::builder()
@@ -406,22 +468,22 @@ async fn generate(app: App, headers: HeaderMap, body: Value, responses: bool) ->
                 Some("completed" | "incomplete")
             ) =>
         {
-            Json(if responses {
-                api::response_result(&response_id, &terminal)
-            } else {
-                api::chat_result(&response_id, &terminal)
+            Json(match wire {
+                Wire::Responses => api::response_result(&response_id, &terminal),
+                Wire::Anthropic => anthropic::result(&response_id, &requested_model, &terminal),
+                Wire::Chat => api::chat_result(&response_id, &terminal),
             })
             .into_response()
         }
         Ok(terminal) => terminal_error(&terminal),
-        Err(_) => error(503, "worker_lost", "generation task ended"),
+        Err(_) => fail(wire, 503, "worker_lost", "generation task ended"),
     }
 }
 
 /// Persists inline image bytes and fills hash-only references from the store so
 /// the worker request is self-contained. Unknown hashes are rejected before
 /// any generation is dispatched.
-fn resolve_images(app: &App, request: &mut Value) -> Result<(), Response> {
+fn resolve_images(app: &App, request: &mut Value, wire: Wire) -> Result<(), Response> {
     use base64::Engine;
     let Some(images) = request.get_mut("images").and_then(Value::as_object_mut) else {
         return Ok(());
@@ -433,18 +495,18 @@ fn resolve_images(app: &App, request: &mut Value) -> Result<(), Response> {
             Some(data) => {
                 let bytes = standard
                     .decode(data)
-                    .map_err(|_| error(400, "invalid_request", "image data is not valid base64"))?;
+                    .map_err(|_| fail(wire, 400, "invalid_request", "image data is not valid base64"))?;
                 app.store
                     .put_image(sha256, &media_type, &bytes)
-                    .map_err(|detail| error(500, "storage_error", &detail))?;
+                    .map_err(|detail| fail(wire, 500, "storage_error", &detail))?;
             }
             None => {
                 let (stored_type, bytes) = app
                     .store
                     .image(sha256)
-                    .map_err(|detail| error(500, "storage_error", &detail))?
+                    .map_err(|detail| fail(wire, 500, "storage_error", &detail))?
                     .ok_or_else(|| {
-                        error(400, "unknown_image", &format!("image {sha256} is not stored; resend it inline"))
+                        fail(wire, 400, "unknown_image", &format!("image {sha256} is not stored; resend it inline"))
                     })?;
                 image["media_type"] = json!(stored_type);
                 image["data"] = json!(standard.encode(bytes));
@@ -454,13 +516,19 @@ fn resolve_images(app: &App, request: &mut Value) -> Result<(), Response> {
     Ok(())
 }
 
-fn replay_result(stored: Value, responses: bool, streaming: bool, include_usage: bool) -> Response {
+fn replay_result(stored: Value, wire: Wire, streaming: bool, include_usage: bool) -> Response {
     if matches!(stored["status"].as_str(), Some("failed" | "cancelled")) {
         return terminal_error(stored.get("response").unwrap_or(&stored));
     }
-    let result = stored[if responses { "response" } else { "chat" }].clone();
+    let result = stored[match wire {
+        Wire::Responses => "response",
+        Wire::Anthropic => "anthropic",
+        Wire::Chat => "chat",
+    }]
+    .clone();
     if result.is_null() {
-        return error(
+        return fail(
+            wire,
             409,
             "incomplete_record",
             "stored request has no terminal payload",
@@ -471,9 +539,18 @@ fn replay_result(stored: Value, responses: bool, streaming: bool, include_usage:
     }
     let id = stored["id"].as_str().unwrap_or("unknown");
     let mut data = Vec::new();
-    if responses {
+    if wire == Wire::Responses {
         let mut stream = ResponsesStream::new(id);
         data.extend_from_slice(&sse(&stream.created(), true));
+        for event in stream.finish(&result) {
+            data.extend_from_slice(&sse(&event, true));
+        }
+    } else if wire == Wire::Anthropic {
+        let mut stream = AnthropicStream::new(id, result["model"].as_str().unwrap_or(api::MODEL));
+        data.extend_from_slice(&sse(
+            &stream.started(result["usage"]["input_tokens"].as_u64().unwrap_or(0)),
+            true,
+        ));
         for event in stream.finish(&result) {
             data.extend_from_slice(&sse(&event, true));
         }

@@ -26,12 +26,15 @@ def test_preserves_other_custom_models_and_makes_exact_backup(tmp_path):
     assert backup.read_bytes() == original
     output = json.loads(target.read_text())
     assert output["logoAnimation"] == "off"
-    assert output["customModels"][0]["model"] == "lfm2.5-8b-a1b"
-    qwasar = output["customModels"][1]
+    qwasar = output["customModels"][0]
     assert qwasar["model"] == "qwasar-qwen38-27b"
     assert qwasar["baseUrl"] == "http://127.0.0.1:8800/v1"
     assert qwasar["provider"] == "generic-chat-completion-api"
     assert qwasar["maxOutputTokens"] == 32768
+    other = output["customModels"][1]
+    assert other["model"] == "lfm2.5-8b-a1b"
+    assert other["displayName"] == "LFM"
+    assert other["index"] == 1
     assert installer().configure(target) is None
 
 

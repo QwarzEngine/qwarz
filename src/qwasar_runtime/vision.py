@@ -141,6 +141,13 @@ class VisionRuntime:
         # fraction from *free* VRAM, which is wrong once the text model already
         # owns ~28 GB in this process.
         self.model.load(device=device)
+        # Device of the TEXT model's embedding table. When it is GPU-resident
+        # (rendezvous R1b relocates it; ids are device-moved on that path), the
+        # MM rows are gathered with the same (GPU) id rows, so the vision
+        # tables must be aligned at embed() time or the mixed gather breaks.
+        from exllamav3.modules.embedding import Embedding
+        text_table = next((m for m in generator.model.modules if isinstance(m, Embedding)), None)
+        self.text_embedding_device = None if text_table is None else text_table.device
         self.cache = EmbeddingCache(cache_entries_setting() if cache_entries is None else cache_entries)
 
     def embed(self, sha256, media_type, data):
@@ -163,4 +170,17 @@ class VisionRuntime:
             image.seek(0)
         width, height = image.size
         embedding = self.model.get_image_embeddings(self.tokenizer, image)
+        # The MM rows are gathered with the same id rows the text-embedding
+        # path uses. Align the MM tables to the text table's device when it is
+        # GPU-resident (rendezvous R1b); on the stock CPU-table stacks the
+        # loader's placement already matches.
+        target_device = self.text_embedding_device
+        if target_device is not None and str(target_device) != "cpu":
+            if embedding.embeddings is not None and embedding.embeddings.device != target_device:
+                embedding.embeddings = embedding.embeddings.to(target_device)
+            if embedding.deepstack_embeddings:
+                embedding.deepstack_embeddings = [
+                    de.to(target_device) if de.device != target_device else de
+                    for de in embedding.deepstack_embeddings
+                ]
         return self.cache.put(ImageEmbedding(sha256, list(embedding.token_list), width, height, embedding))

@@ -49,6 +49,110 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_tools([{"type": "function", "function": {"name": "x>bad", "parameters": {}}}])
 
+    def test_grep_flag_parameter_names_are_accepted(self):
+        validate_tools([{"type": "function", "function": {"name": "grep", "parameters": {
+            "type": "object", "properties": {
+                "-A": {"type": "integer"}, "-B": {"type": "integer"},
+                "-C": {"type": "integer"}, "-i": {"type": "boolean"},
+                "pattern": {"type": "string"}}}}}])
+
+    def test_flag_parameters_round_trip_in_native_xml(self):
+        tools = [{"type": "function", "function": {"name": "grep", "parameters": {
+            "type": "object", "properties": {
+                "-A": {"type": "integer"}, "-i": {"type": "boolean"},
+                "pattern": {"type": "string"}},
+            "required": ["pattern"]}}}]
+        parser = StreamParser("off", tools, "resp_a")
+        parser.feed('<tool_call><function=grep><parameter=pattern>TODO</parameter>'
+                    '<parameter=-A>2</parameter><parameter=-i>true</parameter>'
+                    '</function></tool_call>')
+        arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments, {"pattern": "TODO", "-A": 2, "-i": True})
+
+    def test_hermes_boolean_literals_match_json_true_false(self):
+        tools = [{"type": "function", "function": {"name": "terminal", "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "background": {"type": "boolean"},
+                "notify": {"anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]},
+            },
+            "required": ["command"]}}}]
+        for raw, expected in (
+            ("True", True), ("False", False), ("yes", True), ("NO", False),
+            ("true", True), (" false ", False),
+        ):
+            parser = StreamParser("off", tools, "resp_bool")
+            parser.feed(
+                "<tool_call>\n<function=terminal>\n"
+                f"<parameter=background>\n{raw}\n</parameter>\n"
+                "<parameter=command>\necho ok\n</parameter>\n"
+                "<parameter=notify>\nTrue\n</parameter>\n"
+                "</function>\n</tool_call>"
+            )
+            arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+            self.assertEqual(arguments, {"background": expected, "command": "echo ok", "notify": True}, raw)
+
+    def test_boolean_garbage_is_still_rejected(self):
+        tools = [{"type": "function", "function": {"name": "terminal", "parameters": {
+            "type": "object", "properties": {"background": {"type": "boolean"}}}}}]
+        parser = StreamParser("off", tools, "resp_bad")
+        parser.feed("<tool_call><function=terminal><parameter=background>Trueish</parameter></function></tool_call>")
+        with self.assertRaisesRegex(ValueError, "invalid JSON value for background"):
+            parser.finish()
+
+    def test_string_true_is_not_coerced_to_boolean(self):
+        tools = [{"type": "function", "function": {"name": "write", "parameters": {
+            "type": "object", "properties": {"content": {"type": "string"}}}}}]
+        parser = StreamParser("off", tools, "resp_str")
+        parser.feed("<tool_call><function=write><parameter=content>\nTrue\n</parameter></function></tool_call>")
+        arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments["content"], "True")
+
+    def test_on_off_and_padded_integer_literals(self):
+        tools = [{"type": "function", "function": {"name": "run", "parameters": {
+            "type": "object", "properties": {
+                "alive": {"type": "boolean"}, "count": {"type": "integer"}}}}}]
+        parser = StreamParser("off", tools, "resp_pad")
+        parser.feed("<tool_call><function=run><parameter=alive>\nON\n</parameter>"
+                    "<parameter=count>\n 3 \n</parameter></function></tool_call>")
+        arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments, {"alive": True, "count": 3})
+
+    def test_two_hermes_terminal_calls_with_python_bools(self):
+        tools = [{"type": "function", "function": {"name": "terminal", "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "background": {"type": "boolean"},
+                "notify": {"anyOf": [{"type": "boolean"}, {"type": "array", "items": {"type": "string"}}]},
+            },
+            "required": ["command"]}}}]
+        parser = StreamParser("off", tools, "resp_two")
+        parser.feed(
+            "<tool_call>\n<function=terminal>\n"
+            "<parameter=background>\nTrue\n</parameter>\n"
+            "<parameter=command>\nuv venv --python 3.14 /tmp/x\n</parameter>\n"
+            "<parameter=notify>\ntrue\n</parameter>\n"
+            "</function>\n</tool_call>\n"
+            "<tool_call>\n<function=terminal>\n"
+            "<parameter=background>\nFalse\n</parameter>\n"
+            "<parameter=command>\nls\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        message = parser.finish()
+        self.assertEqual(len(message["tool_calls"]), 2)
+        first, second = (json.loads(call["function"]["arguments"]) for call in message["tool_calls"])
+        self.assertEqual(first["background"], True)
+        self.assertEqual(first["notify"], True)
+        self.assertEqual(second["background"], False)
+        self.assertEqual(second["command"], "ls")
+
+    def test_parameter_name_still_rejects_tag_breakers(self):
+        with self.assertRaisesRegex(ValueError, "invalid parameter name"):
+            validate_tools([{"type": "function", "function": {"name": "grep", "parameters": {
+                "type": "object", "properties": {"-A><|im_end|>": {"type": "integer"}}}}}])
+
     def test_incomplete_reasoning_prefix_never_becomes_content(self):
         parser = StreamParser("medium", [], "resp_a")
         parser.feed("reason</thi")

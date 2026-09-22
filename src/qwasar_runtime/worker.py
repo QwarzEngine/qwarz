@@ -94,7 +94,7 @@ def main():
     parser = argparse.ArgumentParser(description="Qwasar version 1 JSONL worker")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--context-size", type=int, default=262144)
-    parser.add_argument("--prefill", choices=("baseline", "flash"), default="flash")
+    parser.add_argument("--prefill", choices=("baseline", "flash", "xqa"), default="flash")
     parser.add_argument("--gpu-split-gb", type=float, default=30.0)
     parser.add_argument("--fake", action="store_true", help="Explicit deterministic CPU fixture runtime; never loads CUDA")
     args = parser.parse_args()

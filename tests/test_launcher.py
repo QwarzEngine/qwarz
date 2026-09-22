@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,6 +44,15 @@ def test_process_identity_survives_binary_replacement():
     module = launcher()
     with patch.object(module, "process_start", return_value="123"), patch.object(module.os, "readlink", return_value=str(module.BINARY) + " (deleted)"), patch.object(module.Path, "read_bytes", return_value=bytes(str(module.BINARY), "utf8") + b"\0"):
         assert module.same_process({"pid": 1234, "start": "123"})
+
+
+def test_process_identity_accepts_qwasar_symlink_script_path():
+    module = launcher()
+    script = Path("/home/rekeyea/Documents/llm/qwasar/scripts/qwasar.py")
+    command = [b"/usr/bin/python3", os.fsencode(str(script)), b"serve", b"--prefill", b"flash"]
+    resolved = module.resolved_command(command)
+    assert os.fsencode(str((ROOT / "scripts/qwasar.py").resolve())) in resolved
+    assert b"serve" in command
 
 
 def test_existing_process_is_not_reported_ready_when_worker_is_loading():

@@ -1,3 +1,4 @@
+import json
 import threading
 import unittest
 from unittest.mock import patch
@@ -9,7 +10,7 @@ from qwasar_runtime.rendering import CONTINUE_OR_ANSWER, PREFER_EDIT, encode
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.backend = FakeBackend()
-        self.engine = Engine(self.backend, context_size=8192)
+        self.engine = Engine(self.backend, context_size=262144)
 
     def run_request(self, request, parent=None, cancel=None):
         events = list(self.engine.generate("resp_test", request, parent, cancel or threading.Event()))
@@ -21,7 +22,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(first["status"], "completed")
         snapshot = first["snapshot"]
         followup = {"messages": snapshot["messages"] + [{"role": "user", "content": "again"}]}
-        self.engine = Engine(FakeBackend(), context_size=8192)
+        self.engine = Engine(FakeBackend(), context_size=262144)
         second = self.run_request(followup, snapshot)[-1]
         self.assertEqual(second["snapshot"]["tape"][:len(snapshot["tape"])], snapshot["tape"])
         followup["thinking"] = "off"
@@ -34,6 +35,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(prompt.tokens.count(self.backend.tokenizer.special["<|im_start|>"]), 2)
 
     def test_context_budget_rejected_before_enqueue(self):
+        self.engine = Engine(self.backend, context_size=8192)
         events = self.run_request({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 8192})
         self.assertEqual(events[-1]["error"]["code"], "context_length_exceeded")
         self.assertEqual(self.backend.enqueued, 0)
@@ -51,9 +53,48 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.run_request({"messages": [{"role": "user", "content": "ok"}]})[-1]["status"], "completed")
 
     def test_max_tokens_does_not_invent_terminator(self):
-        terminal = self.run_request({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 2})[-1]
+        terminal = self.run_request({"messages": [{"role": "user", "content": "hello"}],
+                                     "thinking": "off", "max_tokens": 2})[-1]
+        self.assertEqual(terminal["status"], "incomplete")
+        self.assertEqual(terminal["metrics"]["incomplete_reason"], "max_new_tokens")
+        self.assertIsNone(terminal["snapshot"])
+
+    def test_undeclared_tool_is_incomplete_without_claiming_truncation(self):
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+        terminal = self.run_request({"messages": [{"role": "user", "content": "[fake:undeclared-tool]"}],
+                                     "tools": tools})[-1]
         self.assertEqual(terminal["status"], "incomplete")
         self.assertIsNone(terminal["snapshot"])
+        self.assertIsNone(terminal["error"])
+        self.assertEqual(terminal["metrics"]["incomplete_reason"], "undeclared_tool")
+        self.assertEqual(terminal["metrics"]["tool_error"]["stage"], "native_parse")
+        self.assertIn("missing", terminal["metrics"]["tool_error"]["tool"])
+        self.assertEqual(terminal["message"]["tool_calls"], [])
+
+    def test_hermes_python_bool_tool_call_completes(self):
+        tools = [{"type": "function", "function": {"name": "terminal", "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "background": {"type": "boolean"},
+            },
+            "required": ["command"]}}}]
+        terminal = self.run_request({"messages": [{"role": "user", "content": "[fake:hermes-bool]"}],
+                                     "tools": tools, "thinking": "off"})[-1]
+        self.assertEqual(terminal["status"], "completed")
+        arguments = json.loads(terminal["message"]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(arguments, {"background": True, "command": "echo ok"})
+
+    def test_malformed_arguments_are_incomplete_without_claiming_truncation(self):
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+        terminal = self.run_request({"messages": [{"role": "user", "content": "[fake:bad-args]"}],
+                                     "tools": tools})[-1]
+        self.assertEqual(terminal["status"], "incomplete")
+        self.assertEqual(terminal["metrics"]["incomplete_reason"], "malformed_tool_call")
+        self.assertEqual(terminal["metrics"]["tool_error"]["stage"], "native_parse")
+        self.assertIn("malformed", terminal["metrics"]["tool_error"]["error"])
 
     def test_temperature_and_tool_choice_validation(self):
         for options in ({"temperature": -1}, {"top_p": 2}, {"tool_choice": "required"}, {"thinking": "high"}):

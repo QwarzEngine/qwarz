@@ -1,0 +1,30 @@
+{
+  "env": {
+    "QWASAR_API_KEY": "qwasar-local"
+  },
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwasar-qwen38-27b",
+        "name": "Qwarz Qwen3.8 27B",
+        "description": "Local Qwasar Qwen3.8 27B (OpenAI-compatible)",
+        "baseUrl": "http://127.0.0.1:8800/v1",
+        "envKey": "QWASAR_API_KEY",
+        "generationConfig": {
+          "timeout": 600000,
+          "streamIdleTimeoutMs": 600000,
+          "maxRetries": 1,
+          "contextWindowSize": 262144,
+          "modalities": {
+            "image": true
+          }
+        },
+        "capabilities": {
+          "reasoning": {
+            "profile": "qwen-chat-template"
+          }
+        }
+      }
+    ]
+  }
+}

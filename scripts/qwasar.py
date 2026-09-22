@@ -48,6 +48,16 @@ def process_start(pid):
     return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 
 
+def resolved_command(parts):
+    resolved = []
+    for part in parts:
+        try:
+            resolved.append(os.fsencode(str(Path(os.fsdecode(part)).resolve())))
+        except (OSError, ValueError):
+            resolved.append(part)
+    return resolved
+
+
 def same_process(record):
     try:
         pid = int(record["pid"])
@@ -55,7 +65,8 @@ def same_process(record):
             return False
         executable = Path(os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)"))
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        return executable == BINARY or (os.fsencode(Path(__file__).resolve()) in command and b"serve" in command)
+        return executable == BINARY or (
+            os.fsencode(Path(__file__).resolve()) in resolved_command(command) and b"serve" in command)
     except (OSError, ValueError, KeyError, IndexError):
         return False
 
@@ -144,7 +155,7 @@ def stop():
 def main():
     parser = argparse.ArgumentParser(description="Manage the dedicated local RTX 5090 Qwasar service")
     parser.add_argument("command", choices=["start", "serve", "stop", "status", "logs", "wait-ready"])
-    parser.add_argument("--prefill", choices=["flash", "baseline"], default="flash")
+    parser.add_argument("--prefill", choices=["flash", "baseline", "xqa"], default="flash")
     parser.add_argument("--pid", type=int)
     arguments = parser.parse_args()
     if arguments.command == "wait-ready":

@@ -1,16 +1,45 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
+import ipaddress
 import json
 import math
 import re
+from urllib.parse import urlsplit
 
 
-NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,127}\Z")
+# Grok's grep tool uses flag-style keys (-A, -B, -C, -i). Names must stay
+# XML-safe so they cannot close a <parameter=...> tag or inject native roles.
+NAME_BODY = r"[A-Za-z0-9_-]{1,128}"
+NAME = re.compile(NAME_BODY + r"\Z")
 TOOL_CALL = re.compile(
-    r"<tool_call>\s*<function=([A-Za-z_][A-Za-z0-9_-]*)>(.*?)</function>\s*</tool_call>", re.S)
+    rf"<tool_call>\s*<function=({NAME_BODY})>(.*?)</function>\s*</tool_call>", re.S)
+PARAMETER = re.compile(rf"\s*<parameter=({NAME_BODY})>(.*?)</parameter>", re.S)
+EMAIL = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
+IDN_EMAIL = re.compile(r"^[^@\s]+@[^@\s.][^@\s]*\Z")
+HOSTNAME_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+IDN_HOSTNAME_LABEL = re.compile(
+    r"^[A-Za-z0-9\u0080-\uffff](?:[A-Za-z0-9\u0080-\uffff-]{0,61}[A-Za-z0-9\u0080-\uffff])?\Z")
+UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+DURATION = re.compile(
+    r"^P(?!$)(?:\d+Y)?(?:\d+M)?(?:\d+W)?(?:\d+D)?(?:T(?!$)(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)?\Z")
+JSON_POINTER = re.compile(r"^(?:/(?:[^~]|~[01])*)*\Z")
+RELATIVE_JSON_POINTER = re.compile(r"^(?:0|[1-9]\d*)(?:#|(?:/(?:[^~]|~[01])*)*)\Z")
 
+
+
+BOOLEAN_LITERALS = {
+    "true": True,
+    "false": False,
+    "yes": True,
+    "no": False,
+    "on": True,
+    "off": False,
+}
 
 
 def canonical(value):
@@ -31,13 +60,140 @@ def parse_json(text):
                       parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
 
 
+def schema_types(schema):
+    if not isinstance(schema, dict):
+        return set()
+    expected = schema.get("type")
+    types = {expected} if isinstance(expected, str) else set(expected or ())
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        for child in schema.get(keyword) or []:
+            types |= schema_types(child)
+    return types
+
+
+def parse_tool_parameter(text, schemas):
+    """Parse one native <parameter> body. JSON first; then Qwen/Hermes scalars."""
+    if any("string" in schema_types(schema) for schema in schemas):
+        return text
+    stripped = text.strip()
+    try:
+        return parse_json(stripped)
+    except (ValueError, TypeError):
+        pass
+    types = set()
+    for schema in schemas:
+        types |= schema_types(schema)
+    if "boolean" in types:
+        try:
+            return BOOLEAN_LITERALS[stripped.casefold()]
+        except KeyError:
+            pass
+    if types:
+        raise ValueError("invalid JSON value")
+    return text
+
+
+def _hostname(value, label):
+    if value.endswith("."):
+        value = value[:-1]
+    return bool(value) and len(value) <= 253 and all(label.fullmatch(part) for part in value.split("."))
+
+
+def _date_time(value):
+    if "T" not in value and "t" not in value:
+        return False
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _date(value):
+    try:
+        datetime.date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _time(value):
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        datetime.time.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _ip(value, version):
+    try:
+        return ipaddress.ip_address(value).version == version
+    except ValueError:
+        return False
+
+
+def _uri(value, absolute=True):
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    if " " in value or "\\" in value:
+        return False
+    return bool(parts.scheme and (parts.netloc or parts.path)) if absolute else True
+
+
+def _regex(value):
+    try:
+        re.compile(value)
+        return True
+    except re.error:
+        return False
+
+
+STRING_FORMATS = {
+    "date-time": _date_time,
+    "date": _date,
+    "time": _time,
+    "duration": DURATION.fullmatch,
+    "email": EMAIL.fullmatch,
+    "idn-email": IDN_EMAIL.fullmatch,
+    "hostname": lambda value: _hostname(value, HOSTNAME_LABEL),
+    "idn-hostname": lambda value: _hostname(value, IDN_HOSTNAME_LABEL),
+    "ipv4": lambda value: _ip(value, 4),
+    "ipv6": lambda value: _ip(value, 6),
+    "uri": lambda value: _uri(value, True),
+    "uri-reference": lambda value: _uri(value, False),
+    "iri": lambda value: _uri(value, True),
+    "iri-reference": lambda value: _uri(value, False),
+    "uuid": UUID.fullmatch,
+    "json-pointer": JSON_POINTER.fullmatch,
+    "relative-json-pointer": RELATIVE_JSON_POINTER.fullmatch,
+    "regex": _regex,
+}
+
+
+def _validate_format(value, name):
+    checker = STRING_FORMATS.get(name)
+    if checker is not None and isinstance(value, str) and not checker(value):
+        raise ValueError(f"string does not match format {name}")
+    if name == "int32" and type(value) is int and not (-2**31 <= value <= 2**31 - 1):
+        raise ValueError("number does not match format int32")
+    if name == "int64" and type(value) is int and not (-2**63 <= value <= 2**63 - 1):
+        raise ValueError("number does not match format int64")
+
+
 def validate_schema(schema, depth=0):
     if type(schema) is bool:
         return
     if not isinstance(schema, dict) or depth > 32:
         raise ValueError("invalid or excessively nested schema")
-    supported = {"type", "properties", "patternProperties", "required", "additionalProperties", "items", "minItems", "maxItems",
-        "uniqueItems", "minLength", "maxLength", "pattern", "minimum", "maximum", "exclusiveMinimum",
+    supported = {"type", "properties", "patternProperties", "propertyNames", "required", "additionalProperties",
+        "items", "prefixItems", "minItems", "maxItems",
+        "uniqueItems", "minLength", "maxLength", "pattern", "format", "minimum", "maximum", "exclusiveMinimum",
         "exclusiveMaximum", "enum", "const", "anyOf", "oneOf", "allOf", "$ref", "$defs", "definitions",
         "$schema", "$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"}
     unknown = schema.keys() - supported
@@ -59,9 +215,15 @@ def validate_schema(schema, depth=0):
                         raise ValueError("invalid patternProperties pattern") from error
             for child in schema[keyword].values():
                 validate_schema(child, depth + 1)
-    for keyword in ("additionalProperties", "items"):
+    for keyword in ("additionalProperties", "items", "propertyNames"):
         if keyword in schema:
             validate_schema(schema[keyword], depth + 1)
+    if "prefixItems" in schema:
+        prefixes = schema["prefixItems"]
+        if not isinstance(prefixes, list):
+            raise ValueError("prefixItems must be an array")
+        for child in prefixes:
+            validate_schema(child, depth + 1)
     for keyword in ("anyOf", "oneOf", "allOf"):
         if keyword in schema:
             if not isinstance(schema[keyword], list) or not schema[keyword]:
@@ -78,6 +240,8 @@ def validate_schema(schema, depth=0):
             re.compile(schema["pattern"])
         except (re.error, TypeError) as error:
             raise ValueError("invalid schema pattern") from error
+    if "format" in schema and (not isinstance(schema["format"], str) or not schema["format"]):
+        raise ValueError("format must be a nonempty string")
 
 
 def property_schemas(schema, name):
@@ -152,6 +316,9 @@ def _validate_value(value, schema, root, path):
     if isinstance(value, dict):
         if set(schema.get("required", [])) - value.keys():
             raise ValueError("missing required parameters")
+        if "propertyNames" in schema:
+            for name in value:
+                validate_value(name, schema["propertyNames"], root, (*path, name))
         for name, item in value.items():
             for candidate in property_schemas(schema, name):
                 validate_value(item, candidate, root, (*path, name))
@@ -160,18 +327,25 @@ def _validate_value(value, schema, root, path):
             raise ValueError("array length outside schema")
         if schema.get("uniqueItems") and len({canonical(item) for item in value}) != len(value):
             raise ValueError("array items must be unique")
+        prefixes = schema.get("prefixItems")
+        prefixes = prefixes if isinstance(prefixes, list) else []
         for index, item in enumerate(value):
-            validate_value(item, schema.get("items", True), root, (*path, index))
+            item_schema = prefixes[index] if index < len(prefixes) else schema.get("items", True)
+            validate_value(item, item_schema, root, (*path, index))
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
             raise ValueError("string length outside schema")
         if "pattern" in schema and not re.search(schema["pattern"], value):
             raise ValueError("string does not match pattern")
+        if "format" in schema:
+            _validate_format(value, schema["format"])
     if type(value) in (int, float):
         if not math.isfinite(value) or value < schema.get("minimum", -math.inf) or value > schema.get("maximum", math.inf):
             raise ValueError("number outside schema")
         if value <= schema.get("exclusiveMinimum", -math.inf) or value >= schema.get("exclusiveMaximum", math.inf):
             raise ValueError("number outside exclusive limits")
+        if "format" in schema:
+            _validate_format(value, schema["format"])
 
 
 TEXT_KEYS = ("title", "label", "text", "value", "question", "name")
@@ -197,8 +371,16 @@ def coerce_value(value, schema):
         text = _as_text(value)
         if text is not None:
             value = text
+    if "boolean" in types and isinstance(value, str):
+        try:
+            value = BOOLEAN_LITERALS[value.strip().casefold()]
+        except KeyError:
+            pass
     if "array" in types and isinstance(value, list):
-        value = [coerce_value(item, schema.get("items", True)) for item in value]
+        prefixes = schema.get("prefixItems")
+        prefixes = prefixes if isinstance(prefixes, list) else []
+        value = [coerce_value(item, prefixes[index] if index < len(prefixes) else schema.get("items", True))
+                 for index, item in enumerate(value)]
     if "object" in types and isinstance(value, str):
         required = [name for name in schema.get("required", []) if name in TEXT_KEYS]
         if len(required) == 1:
@@ -451,7 +633,7 @@ class StreamParser:
                 schema, arguments = self.functions[name], {}
                 self.tool_diagnostic["parsed_arguments"] = arguments
                 while parameters.strip():
-                    parameter = re.match(r"\s*<parameter=([A-Za-z_][A-Za-z0-9_-]*)>(.*?)</parameter>", parameters, re.S)
+                    parameter = PARAMETER.match(parameters)
                     if not parameter or parameter[1] in arguments:
                         raise ValueError("malformed or duplicate parameter")
                     key, value = parameter.group(1, 2)
@@ -459,16 +641,10 @@ class StreamParser:
                         value = value[1:]
                     if value.endswith("\n"):
                         value = value[:-1]
-                    kind = schema.get("properties", {}).get(key, {}).get("type")
-                    if any(isinstance(candidate, dict) and candidate.get("type") == "string"
-                           for candidate in property_schemas(schema, key)):
-                        kind = "string"
-                    if kind != "string":
-                        try:
-                            value = parse_json(value)
-                        except (ValueError, TypeError):
-                            if kind is not None:
-                                raise ValueError(f"invalid JSON value for {key}")
+                    try:
+                        value = parse_tool_parameter(value, property_schemas(schema, key))
+                    except ValueError:
+                        raise ValueError(f"invalid JSON value for {key}")
                     arguments[key] = value
                     parameters = parameters[parameter.end():]
                 arguments = coerce_arguments(arguments, schema)

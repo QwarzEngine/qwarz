@@ -53,6 +53,9 @@ def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path
     assert terminal['snapshot'] is None
     assert terminal['error'] is None
     assert terminal['message']['tool_calls'] == []
+    assert terminal['metrics']['incomplete_reason'] == 'invalid_tool_arguments'
+    assert terminal['metrics']['tool_error'] == {'stage': 'schema_validation', 'tool': 'ask_user_question',
+                                                'call_index': 0, 'error': 'expected string'}
     assert 'PRIVATE_VALUE' not in json.dumps(events)
     record = json.loads(next(directory.glob('*.json')).read_text())
     assert record['raw_tool_calls'] == RAW
@@ -99,6 +102,8 @@ def test_unclosed_native_call_is_incomplete(tmp_path):
     assert terminal['error'] is None
     assert terminal['snapshot'] is None
     assert terminal['message']['tool_calls'] == []
+    assert terminal['metrics']['incomplete_reason'] == 'unclosed_tool_call'
+    assert terminal['metrics']['tool_error']['stage'] == 'incomplete_native_parse'
     assert backend.resets == 0
     record = json.loads(next(tmp_path.glob('*.json')).read_text())
     assert record['stage'] == 'incomplete_native_parse'

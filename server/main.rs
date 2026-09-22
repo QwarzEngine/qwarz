@@ -32,7 +32,7 @@ async fn run() -> Result<(), String> {
         }
         if argument == "--help" {
             println!(
-                "qwasar-server [--host 127.0.0.1] [--port 8800] [--database state/qwasar.db] [--python PATH] [--model PATH] [--prefill flash|baseline] [--context-size 262144] [--request-timeout-secs 600] [--cancel-timeout-secs 30] [--fake-worker]"
+                "qwasar-server [--host 127.0.0.1] [--port 8800] [--database state/qwasar.db] [--python PATH] [--model PATH] [--prefill flash|baseline|xqa] [--context-size 262144] [--request-timeout-secs 600] [--cancel-timeout-secs 30] [--fake-worker]"
             );
             return Ok(());
         }
@@ -63,7 +63,7 @@ async fn run() -> Result<(), String> {
             _ => return Err(format!("unknown option {argument}")),
         }
     }
-    if !["flash", "baseline"].contains(&config.prefill.as_str())
+    if !["flash", "baseline", "xqa"].contains(&config.prefill.as_str())
         || config.context_size == 0
         || config.context_size > 262144
         || config.context_size % 256 != 0

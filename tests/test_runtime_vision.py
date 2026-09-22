@@ -67,7 +67,7 @@ class RenderTests(unittest.TestCase):
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.backend = FakeBackend()
-        self.engine = Engine(self.backend, context_size=8192)
+        self.engine = Engine(self.backend, context_size=262144)
 
     def run_request(self, request, parent=None):
         events = list(self.engine.generate("resp_vision", request, parent, threading.Event()))
@@ -100,7 +100,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(prompt.segments), 1)
         self.assertEqual(self.backend.images.hits, 1)
         # A fresh process gets new dynamic IDs; segments still apply and nothing is ambiguous.
-        fresh = Engine(FakeBackend(), context_size=8192)
+        fresh = Engine(FakeBackend(), context_size=262144)
         prompt = fresh.prepare(followup, snapshot)
         self.assertEqual(len(prompt.segments), 1)
 
@@ -133,6 +133,7 @@ class EngineTests(unittest.TestCase):
         raw = png_bytes(1920, 1080)
         sha, request = image_request(raw)
         request["max_tokens"] = 8192 - 100
+        self.engine = Engine(self.backend, context_size=8192)
         terminal = self.run_request(request)[-1]
         self.assertEqual(terminal["error"]["code"], "context_length_exceeded")
 

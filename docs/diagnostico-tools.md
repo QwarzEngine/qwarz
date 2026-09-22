@@ -59,3 +59,20 @@ esquema privados permite distinguir si el modelo emitió un tipo incorrecto o si
 Qwasar lo interpretó mal. Convertir la evidencia real en una regresión sanitizada
 antes de corregirlo. En errores de esquemas compuestos, la ruta puede corresponder
 al nodo `anyOf`/`oneOf`/`allOf` que no se satisface, no a cada rama interna.
+
+## Cómo lo ve el cliente
+
+El terminal de una llamada rechazada sigue siendo `incomplete` con
+`error: null`, pero ahora `qwasar_metrics.incomplete_reason` indica la causa
+(`undeclared_tool`, `malformed_tool_call`, `invalid_tool_arguments`,
+`unclosed_tool_call`, `tool_choice_mismatch`, `missing_tool_call` o
+`unterminated_reasoning`) y `qwasar_metrics.tool_error` resume `stage`, `tool`,
+`call_index` y el mensaje de error. Ese resumen no incluye XML, valores de
+argumentos ni rutas locales, y es lo único que viaja en la respuesta.
+
+Solo `max_new_tokens` y `reasoning_budget` son truncamiento real de salida y
+siguen reportándose como `finish_reason: "length"` (Anthropic `max_tokens`,
+Responses `incomplete_details.reason: "max_output_tokens"`). El resto termina
+con `finish_reason: "stop"` (`end_turn`), porque un cliente que interpreta
+`length` como presión de contexto —OMP descarta el turno y compacta— entra en
+mantenimiento automático inútil ante un error de parseo.

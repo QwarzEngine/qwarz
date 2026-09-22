@@ -13,8 +13,8 @@ pub fn models_payload() -> Value {
         "data":[{"id":MODEL,"object":"model","owned_by":"qwasar","context_window":262144}],
         "models":[{
             "slug":MODEL,
-            "display_name":"Qwasar Qwen3.8-27B",
-            "description":"Qwasar hybrid (RTX 5090, NVIDIA64+PRIMS+ATT64), 262k ctx, native image input.",
+            "display_name":"Qwarz Qwen3.8-27B",
+            "description":"Qwarz hybrid (RTX 5090, NVIDIA64+PRIMS+ATT64), 262k ctx, native image input.",
             "base_instructions":CODEX_INSTRUCTIONS,
             "supported_reasoning_levels":[
                 {"effort":"low","description":"Low reasoning"},
@@ -32,6 +32,7 @@ pub fn models_payload() -> Value {
             "context_window":262144,
             "max_context_window":262144,
             "effective_context_window_percent":95,
+            "supports_image_detail_original":false,
             "input_modalities":["text","image"]
         }]
     })
@@ -124,13 +125,111 @@ fn image_url(part: &Value) -> Result<&str, String> {
     }
 }
 
-/// Normalizes user content into either a plain string (text only) or a parts
-/// array mixing `text` and canonical `image` parts. Only user messages may
-/// carry images; every other role goes through `text_content`.
+fn split_text_and_images(content: Value) -> (String, Vec<Value>) {
+    match content {
+        Value::String(text) => (text, Vec::new()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            let mut images = Vec::new();
+            for part in parts {
+                if part["type"] == "text" {
+                    text.push_str(part["text"].as_str().unwrap_or(""));
+                } else if part["type"] == "image" {
+                    images.push(part);
+                }
+            }
+            (text, images)
+        }
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+fn droid_tool_image_caption(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("Image content from ") && text.ends_with(':')
+}
+
+/// Droid inserts a user image message between sibling tool results. Fold those
+/// pixels into the hoist buffer so parallel results stay consecutive.
+fn tool_followup_images(content: &Value) -> Option<Vec<Value>> {
+    let (text, images) = split_text_and_images(content.clone());
+    if !images.is_empty() && (text.trim().is_empty() || droid_tool_image_caption(&text)) {
+        Some(images)
+    } else if images.is_empty() && droid_tool_image_caption(&text) {
+        Some(Vec::new())
+    } else {
+        None
+    }
+}
+
+/// Droid then drops sibling `tool_calls` that are no longer immediately
+/// followed by `role:tool`. Reattach the orphan result to that assistant.
+fn attach_missing_tool_calls(messages: &mut [Value]) {
+    let mut pending = std::collections::HashSet::new();
+    let mut completed = std::collections::HashSet::new();
+    let mut last_assistant = None;
+    for index in 0..messages.len() {
+        match messages[index]["role"].as_str() {
+            Some("assistant") => {
+                last_assistant = Some(index);
+                if let Some(calls) = messages[index]["tool_calls"].as_array() {
+                    for call in calls {
+                        if let Some(id) = call["id"].as_str() {
+                            pending.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            Some("tool") => {
+                let id = messages[index]["tool_call_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if id.is_empty() || pending.remove(&id) {
+                    completed.insert(id);
+                    continue;
+                }
+                if completed.contains(&id) {
+                    continue;
+                }
+                let Some(assistant) = last_assistant else {
+                    continue;
+                };
+                let name = messages[index]
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("tool");
+                let call = json!({"id":id,"type":"function","function":{"name":name,"arguments":"{}"}});
+                match messages[assistant].get_mut("tool_calls") {
+                    Some(Value::Array(calls)) => calls.push(call),
+                    _ => messages[assistant]["tool_calls"] = json!([call]),
+                }
+                completed.insert(id);
+            }
+            Some("user") => {
+                last_assistant = None;
+                pending.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Normalizes mixed content into either a plain string (text only) or a parts
+/// array mixing `text` and canonical `image` parts. User messages keep images
+/// in place; tool results hoist images onto a following user message.
 pub fn user_content(value: &Value, images: &mut Images) -> Result<Value, String> {
-    let Value::Array(parts) = value else {
-        return Ok(json!(text_content(value)?));
-    };
+    match value {
+        Value::Array(parts) => content_parts(parts, images),
+        Value::Object(object) if object.get("type").is_some() => {
+            content_parts(std::slice::from_ref(value), images)
+        }
+        other => Ok(json!(text_content(other)?)),
+    }
+}
+
+fn content_parts(parts: &[Value], images: &mut Images) -> Result<Value, String> {
     let mut output: Vec<Value> = Vec::new();
     let mut has_image = false;
     for part in parts {
@@ -204,18 +303,41 @@ pub fn text_content(value: &Value) -> Result<String, String> {
 
 pub fn normalize_messages(messages: &[Value], images: &mut Images) -> Result<Vec<Value>, String> {
     let mut normalized: Vec<Value> = Vec::new();
+    let mut pending_images: Vec<Value> = Vec::new();
     let mut system_index: Option<usize> = None;
+    let mut after_tool = false;
     for message in messages {
         let role = message["role"].as_str().ok_or("message requires role")?;
         let role = if role == "developer" { "system" } else { role };
         if !matches!(role, "system" | "user" | "assistant" | "tool") {
             return Err("unsupported message role".into());
         }
+        if role == "tool" {
+            let (text, image_parts) = split_text_and_images(user_content(&message["content"], images)?);
+            normalized.push(json!({
+                "role":"tool",
+                "content":text,
+                "tool_call_id":message["tool_call_id"].as_str().ok_or("tool result requires tool_call_id")?
+            }));
+            pending_images.extend(image_parts);
+            after_tool = true;
+            continue;
+        }
         if role == "user" {
             let content = user_content(&message["content"], images)?;
+            if after_tool {
+                if let Some(image_parts) = tool_followup_images(&content) {
+                    pending_images.extend(image_parts);
+                    continue;
+                }
+            }
+            flush_tool_images(&mut normalized, &mut pending_images);
+            after_tool = false;
             normalized.push(json!({"role":"user","content":content}));
             continue;
         }
+        flush_tool_images(&mut normalized, &mut pending_images);
+        after_tool = false;
         let content = text_content(&message["content"])
             .map_err(|error| if error.starts_with("only text") { "images are only supported in user messages".to_string() } else { error })?;
         if role == "system" {
@@ -239,22 +361,13 @@ pub fn normalize_messages(messages: &[Value], images: &mut Images) -> Result<Vec
             if let Some(reasoning) = message.get("reasoning_content") {
                 entry["reasoning_content"] = json!(text_content(reasoning)?);
             }
-            if let Some(calls) = message.get("tool_calls") {
-                if !calls.is_array() {
-                    return Err("tool_calls must be an array".into());
-                }
-                entry["tool_calls"] = calls.clone();
+            if let Some(calls) = assistant_tool_calls(message.get("tool_calls"))? {
+                entry["tool_calls"] = calls;
             }
-        }
-        if role == "tool" {
-            entry["tool_call_id"] = json!(
-                message["tool_call_id"]
-                    .as_str()
-                    .ok_or("tool result requires tool_call_id")?
-            );
         }
         normalized.push(entry);
     }
+    flush_tool_images(&mut normalized, &mut pending_images);
     Ok(normalized)
 }
 
@@ -313,8 +426,90 @@ fn json_argument_string(value: &Value) -> String {
     }
 }
 
-fn assistant_function_call(id: &str, name: &str, arguments: String) -> Value {
-    json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":arguments}}]})
+fn assistant_tool_calls(value: Option<&Value>) -> Result<Option<Value>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(calls)) if calls.is_empty() => Ok(None),
+        Some(Value::Array(calls)) => Ok(Some(json!(calls))),
+        Some(call) if call.is_object() => Ok(Some(json!([call]))),
+        Some(_) => Err("tool_calls must be an array".into()),
+    }
+}
+
+fn append_assistant_tool_call(messages: &mut Vec<Value>, id: &str, name: &str, arguments: String) {
+    let call = json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}});
+    if let Some(last) = messages.last_mut() {
+        if last["role"] == "assistant" {
+            if let Some(calls) = last["tool_calls"].as_array_mut() {
+                calls.push(call);
+                return;
+            }
+            if last.get("content").is_none_or(Value::is_null) || last["content"] == "" {
+                last["tool_calls"] = json!([call]);
+                return;
+            }
+        }
+    }
+    messages.push(json!({"role":"assistant","content":"","tool_calls":[call]}));
+}
+
+fn flush_tool_images(messages: &mut Vec<Value>, images: &mut Vec<Value>) {
+    if !images.is_empty() {
+        messages.push(json!({"role":"user","content":std::mem::take(images)}));
+    }
+}
+
+fn image_hashes(messages: &[Value]) -> Vec<String> {
+    let mut hashes = Vec::new();
+    for message in messages {
+        if let Some(parts) = message["content"].as_array() {
+            for part in parts {
+                if part["type"] == "image" {
+                    if let Some(sha256) = part["sha256"].as_str() {
+                        if !hashes.iter().any(|hash| hash == sha256) {
+                            hashes.push(sha256.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    hashes
+}
+
+fn cap_images(messages: &mut Vec<Value>, images: &mut Images, max_images: usize) {
+    let hashes = image_hashes(messages);
+    if hashes.len() <= max_images {
+        return;
+    }
+    let keep: std::collections::HashSet<String> = hashes[hashes.len() - max_images..].iter().cloned().collect();
+    images.retain(|sha256, _| keep.contains(sha256));
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        if !parts.iter().any(|part| part["type"] == "image") {
+            continue;
+        }
+        let filtered: Vec<Value> = parts
+            .iter()
+            .filter(|part| {
+                part["type"] != "image"
+                    || part["sha256"]
+                        .as_str()
+                        .is_some_and(|sha256| keep.contains(sha256))
+            })
+            .cloned()
+            .collect();
+        if filtered.iter().any(|part| part["type"] == "image") {
+            message["content"] = json!(filtered);
+        } else {
+            message["content"] = json!(filtered
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>());
+        }
+    }
 }
 
 fn function_tool(name: &str, description: Option<&str>, parameters: Value) -> Value {
@@ -415,6 +610,23 @@ fn normalize_tool(tool: &Value, responses: bool) -> Result<Value, String> {
     }
 }
 
+fn append_user_part(messages: &mut Vec<Value>, part: Value) {
+    if let Some(last) = messages.last_mut() {
+        if last["role"] == "user" {
+            match last.get_mut("content") {
+                Some(Value::Array(parts)) => parts.push(part),
+                Some(Value::String(text)) => {
+                    let existing = text.clone();
+                    last["content"] = json!([{"type":"input_text","text":existing}, part]);
+                }
+                _ => last["content"] = json!([part]),
+            }
+            return;
+        }
+    }
+    messages.push(json!({"role":"user","content":[part]}));
+}
+
 fn responses_input(input: &Value) -> Result<Vec<Value>, String> {
     if let Some(text) = input.as_str() {
         return Ok(vec![json!({"role":"user","content":text})]);
@@ -423,26 +635,34 @@ fn responses_input(input: &Value) -> Result<Vec<Value>, String> {
     for item in input.as_array().ok_or("input must be text or an array")? {
         match item["type"].as_str().unwrap_or("message") {
             "message" => messages.push(item.clone()),
+            "input_text" => append_user_part(
+                &mut messages,
+                json!({"type":"input_text","text":item["text"].as_str().ok_or("input_text requires text")?}),
+            ),
+            "input_image" => append_user_part(&mut messages, item.clone()),
             "function_call_output" | "custom_tool_call_output" => messages.push(json!({
                 "role":"tool",
                 "tool_call_id":tool_call_id(item)?,
-                "content":text_content(item.get("output").unwrap_or(&Value::Null))?
+                "content":item.get("output").cloned().unwrap_or(Value::Null)
             })),
-            "function_call" => messages.push(assistant_function_call(
+            "function_call" => append_assistant_tool_call(
+                &mut messages,
                 &tool_call_id(item)?,
                 item["name"].as_str().ok_or("function call requires name")?,
                 json_argument_string(&item["arguments"]),
-            )),
-            "custom_tool_call" => messages.push(assistant_function_call(
+            ),
+            "custom_tool_call" => append_assistant_tool_call(
+                &mut messages,
                 &tool_call_id(item)?,
                 item["name"].as_str().ok_or("custom tool call requires name")?,
                 json_argument_string(&item["input"]),
-            )),
-            "local_shell_call" => messages.push(assistant_function_call(
+            ),
+            "local_shell_call" => append_assistant_tool_call(
+                &mut messages,
                 &tool_call_id(item)?,
                 "local_shell",
                 json_argument_string(&item["action"]),
-            )),
+            ),
             "reasoning" | "web_search_call" | "image_generation_call" => {}
             _ => return Err("unsupported Responses input item".into()),
         }
@@ -483,6 +703,7 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
         "service_tier",
         "access_programs",
         "generate",
+        "response_format",
     ];
     for key in object.keys() {
         if !allowed.contains(&key.as_str()) {
@@ -526,12 +747,14 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
     }
     if let Some(reasoning) = body.get("reasoning") {
         let options = reasoning.as_object().ok_or("reasoning must be an object")?;
-        if options
-            .keys()
-            .any(|key| key != "effort" && key != "summary" && key != "context")
+        if options.keys().any(|key| {
+            key != "effort" && key != "summary" && key != "context" && key != "enabled"
+        }) || options
+            .get("effort")
+            .is_some_and(|value| !value.is_string())
             || options
-                .get("effort")
-                .is_some_and(|value| !value.is_string())
+                .get("enabled")
+                .is_some_and(|value| !value.is_boolean())
         {
             return Err("only a string reasoning.effort is supported".into());
         }
@@ -568,18 +791,11 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
             .clone();
     }
     let mut images = Images::new();
-    let messages = normalize_messages(&messages, &mut images)?;
+    let mut messages = normalize_messages(&messages, &mut images)?;
+    attach_missing_tool_calls(&mut messages);
+    cap_images(&mut messages, &mut images, MAX_IMAGES);
     if !messages.iter().any(|message| message["role"] == "user") {
         return Err("at least one user message required".into());
-    }
-    let image_parts = messages
-        .iter()
-        .filter_map(|message| message["content"].as_array())
-        .flatten()
-        .filter(|part| part["type"] == "image")
-        .count();
-    if image_parts > MAX_IMAGES {
-        return Err(format!("at most {MAX_IMAGES} images per request"));
     }
     let mut pending = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
@@ -615,12 +831,11 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
     if !pending.is_empty() {
         return Err("all pending tool calls need results before generation".into());
     }
-    let mut thinking = body
-        .get("reasoning_effort")
-        .or_else(|| {
-            body.get("reasoning")
-                .and_then(|reasoning| reasoning.get("effort"))
-        })
+    let explicit_effort = body.get("reasoning_effort").or_else(|| {
+        body.get("reasoning")
+            .and_then(|reasoning| reasoning.get("effort"))
+    });
+    let mut thinking = explicit_effort
         .and_then(Value::as_str)
         .unwrap_or("medium")
         .to_string();
@@ -628,10 +843,9 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
         let kwargs = kwargs
             .as_object()
             .ok_or("chat_template_kwargs must be object")?;
-        if kwargs
-            .keys()
-            .any(|key| key != "enable_thinking" && key != "preserve_thinking")
-        {
+        if kwargs.keys().any(|key| {
+            key != "enable_thinking" && key != "preserve_thinking" && key != "reasoning_effort"
+        }) {
             return Err("unsupported chat template option".into());
         }
         if kwargs
@@ -639,6 +853,21 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
             .is_some_and(|value| value != &json!(true))
         {
             return Err("exact sessions require preserve_thinking=true".into());
+        }
+        if let Some(effort) = kwargs.get("reasoning_effort") {
+            let effort = effort
+                .as_str()
+                .ok_or("chat_template_kwargs.reasoning_effort must be a string")?;
+            if let Some(explicit) = explicit_effort.and_then(Value::as_str) {
+                if explicit != effort {
+                    return Err(
+                        "reasoning_effort must not conflict with chat_template_kwargs.reasoning_effort"
+                            .into(),
+                    );
+                }
+            } else {
+                thinking = effort.to_string();
+            }
         }
         if let Some(enabled) = kwargs.get("enable_thinking") {
             if !enabled.is_boolean() {
@@ -649,9 +878,14 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
             }
         }
     }
+    if body.pointer("/reasoning/enabled") == Some(&json!(false)) {
+        thinking = "off".into();
+    }
     thinking = match thinking.as_str() {
+        "none" | "off" => "off",
+        "auto" => "medium",
         "minimal" => "low",
-        "high" | "max" => "xhigh",
+        "high" | "max" | "ultra" => "xhigh",
         other => other,
     }
     .to_string();
@@ -669,7 +903,7 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
         Some(value) => value
             .as_u64()
             .ok_or("output limit must be a positive integer")?,
-        None => 4096,
+        None => 32768,
     };
     if max_tokens == 0 || max_tokens > 32768 {
         return Err("output limit must be 1..32768".into());
@@ -735,9 +969,24 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
     Ok(prepared)
 }
 
+/// Output-limit stops are the only `incomplete` turns that are genuinely
+/// truncated output. Tool-call parse failures and open reasoning end the turn
+/// without hitting the token budget, and reporting them as `length` makes
+/// agent harnesses believe the context is full and run compaction loops.
+pub fn output_limit_incomplete(terminal: &Value) -> bool {
+    match terminal["metrics"]["incomplete_reason"].as_str() {
+        Some(reason) => matches!(reason, "max_new_tokens" | "reasoning_budget"),
+        None => terminal["metrics"]["finish_reason"] == "max_new_tokens",
+    }
+}
+
 pub fn finish_reason(terminal: &Value) -> &'static str {
     if terminal["status"] == "incomplete" {
-        "length"
+        if output_limit_incomplete(terminal) {
+            "length"
+        } else {
+            "stop"
+        }
     } else if terminal["message"]["tool_calls"]
         .as_array()
         .is_some_and(|calls| !calls.is_empty())
@@ -774,7 +1023,7 @@ pub fn response_result(id: &str, terminal: &Value) -> Value {
         }
     }
     json!({"id":id,"object":"response","created_at":terminal["created_at"].as_u64().unwrap_or_else(now),"model":MODEL,"status":terminal["status"],"output":output,
-        "error":terminal["error"],"incomplete_details":if terminal["status"] == "incomplete" {json!({"reason":"max_output_tokens"})} else {Value::Null},
+        "error":terminal["error"],"incomplete_details":if terminal["status"] == "incomplete" && output_limit_incomplete(terminal) {json!({"reason":"max_output_tokens"})} else {Value::Null},
         "usage":{"input_tokens":terminal["usage"]["prompt_tokens"],"output_tokens":terminal["usage"]["completion_tokens"],"total_tokens":terminal["usage"]["total_tokens"],"input_tokens_details":terminal["usage"]["prompt_tokens_details"]},"qwasar_metrics":terminal["metrics"]})
 }
 

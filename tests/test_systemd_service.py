@@ -19,7 +19,7 @@ def launcher():
 def test_unit_uses_foreground_pinned_profile_and_waits_until_ready():
     assert UNIT.exists(), "systemd unit missing"
     unit = UNIT.read_text()
-    for expected in ("Type=exec", "qwasar.py serve --prefill flash", "qwasar.py wait-ready --pid ${MAINPID}",
+    for expected in ("Type=exec", "qwasar.py serve --prefill xqa", "qwasar.py wait-ready --pid ${MAINPID}",
                      "Qwen3.8-27B-EXL3-5.0bpw", "CUDA_VISIBLE_DEVICES=0", "Restart=on-failure",
                      "KillMode=mixed", "WantedBy=default.target"):
         assert expected in unit

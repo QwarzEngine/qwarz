@@ -7,8 +7,8 @@ import unittest
 
 
 class WorkerTests(unittest.TestCase):
-    def start(self):
-        process = subprocess.Popen([sys.executable, "-m", "qwasar_runtime.worker", "--fake", "--context-size", "8192"],
+    def start(self, context_size="262144"):
+        process = subprocess.Popen([sys.executable, "-m", "qwasar_runtime.worker", "--fake", "--context-size", context_size],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")})
         self.addCleanup(self.cleanup, process)
@@ -53,7 +53,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(process.wait(timeout=5), 0)
 
     def test_invalid_budget_emits_error_without_started(self):
-        process = self.start()
+        process = self.start("8192")
         self.send(process, {"op": "generate", "id": "resp_bad", "request": {
             "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8192}})
         event = json.loads(process.stdout.readline())
