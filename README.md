@@ -25,13 +25,45 @@ production stack (`--prefill xqa`, promoted 2026-09-21 after a 37-cell gate):
 | Rendezvous | speculative loop resident on GPU: batched verify, GPU draft chain, embedding table on GPU (+2.5 GB VRAM) |
 | Native vision | MM embedding tables aligned to the compute device |
 
+### How the EXL3 artifact and the NVIDIA64 donor combine
+
+There is no merged hybrid artifact: the production model is a **per-module
+graft assembled at load time** from two pinned artifacts of the same weights.
+
+| part | source | format |
+|---|---|---|
+| attention (Q/K/V/O, GDN), embeddings, `lm_head`, MTP head | EXL3 artifact | 5 bpw (head 6-bit, MTP 4-bit) |
+| vision tower | EXL3 artifact | BF16, untouched |
+| gate/up/down of all 64 layers (192 matrices) | NVIDIA64 donor | NVFP4 (modelopt tensors) |
+
+During load, the MLP loader intercepts ExLlamaV3's `Linear.load`: MLP modules
+matching `layers.*.mlp.*_proj` never read their EXL3 tensors — they take NVFP4
+tensors from the donor shards and run on Blackwell-native tensor-core
+kernels, grafted into the ExLlamaV3 module tree. Everything else loads the
+normal EXL3 path. The engine refuses to serve unless donor dimensions match
+the EXL3 shapes exactly, exactly 192 modules were replaced, and 64 per-layer
+MLP CUDA graphs were captured; donor revision and shard hashes are baked into
+the session identity, so swapping either artifact invalidates sessions.
+
+Why this split: MLPs carry roughly two thirds of the forward matmul FLOPs and
+NVFP4 is the fastest native format on the RTX 5090, while the
+quality-sensitive parts (attention, embeddings, head, MTP) stay on the finer
+EXL3 quants. The quality gate measures this exact mix, not each artifact
+alone.
+
+NVFP4 touches only those 192 MLP weights — not attention, embeddings,
+`lm_head`, MTP or vision. The KV cache is a separate quantization axis
+(K8/V4 on `flash`, NVFP4 one-level on `xqa`).
+
 Rollback to the pre-XQA stack: `--prefill flash` in
 `integrations/systemd/qwasar.service`, `daemon-reload`, restart.
 `QWASAR_RDZ=0` disables the rendezvous path at boot.
 
 Pinned artifact: `thelastspark/Qwen3.8-27B-exl3` @
 `1a6fe4afb5b921fda9f93fd4b06d6c6d5c99a62c`, three shards, 19.9 GB, SHA-256
-verified against the frozen manifest.
+verified against the frozen manifest. The NVIDIA64 donor is pinned by hash in
+`benchmarks/manifests/nvidia-qwen38-27b-nvfp4.json`; changing model or donor
+requires re-pinning and re-validating.
 
 ## Expected numbers
 
