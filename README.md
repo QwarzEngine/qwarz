@@ -99,15 +99,29 @@ noise: ±5% decode, ±2–3 pp acceptance.
 - Large prefills (PRIMS path): 5,300–6,800 tok/s.
 - MTP acceptance ~0.62–0.70, workload dependent; decode tracks it.
 - VRAM: ~27.9 of 32.6 GB peak (~4.5 GB free).
-- Quality gate (frozen checkers): 20/32 coding cells + 4/4 json vs control
-  19/32 (same-day, both arms with rendezvous).
 
-Upgrade deltas vs the previous flash stack (same-day A/B): decode +35% @32K,
-+47% @256K, TTFT −3–4%, acceptance and quality not worse. The 64K proposer
-head adds +5% @32K, +17% @64K, +16% @128K, +6.5% @256K on top, TTFT par,
-acceptance −2.1 pp (gate ±5). Full stats and methodology:
-`results/20260920-rendezvous/community-stats.md` and
-`results/20260922-hot64k-xqa/report.md` (local artifacts).
+### What the 2026-09-22 head promotion improved
+
+Same-day 37-cell matrix, both arms on the production stack (XQA + KV NVFP4 +
+rendezvous), the proposer head as the only delta:
+
+| context | full head (tok/s) | 64K head (tok/s) | decode gain | ms/verify |
+|---|---:|---:|---:|---:|
+| 4K | 255 | 283 | **+11%** | −2.4 |
+| 32K | 219 | 230 | +5% | −2.5 |
+| 64K | 198 | 232 | **+17%** | −2.5 |
+| 128K | 179 | 207 | **+16%** | −2.5 |
+| 256K | 164 | 174 | +6.5% | −2.4 |
+
+TTFT par (±0.2%) at every context; the −2.5 ms/verify is a constant draft
+weight-read saving, so the relative gain is largest where cycles are
+shortest. Quality held: frozen-checker gate 4/4 — coding 20/32 vs control
+19/32, json 4/4, acceptance −2.1 pp (limit ±5), peak VRAM +0.24 GB.
+
+For reference, the whole promoted stack against the pre-XQA flash stack
+(same-day A/B, 2026-09-20): decode +35% @32K, +47% @256K, TTFT −3–4%.
+Full stats and methodology: `results/20260920-rendezvous/community-stats.md`
+and `results/20260922-hot64k-xqa/report.md` (local artifacts).
 
 ## Use it
 
