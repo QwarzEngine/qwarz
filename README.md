@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/qwarz.jpg" width="360" alt="Qwarz"></p>
+
 # Qwarz
 
 Qwarz is an independent inference engine specialized for **Qwen3.8-27B on one
@@ -117,4 +119,5 @@ failed.
 - [Servicio systemd](docs/servicio-systemd.md) — boot, restart, journal
 - [Arquitectura v1](docs/arquitectura-v1.md) — Spanish design walkthrough
 - [Serving evaluation](docs/benchmarks/2026-09-20-serving-evaluation.md) — the lever campaign
+- `docs/qwarz.jpg` — engine icon
 - `results/` (local, gitignored) — campaign data, gate decisions, community stats
