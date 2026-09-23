@@ -10,7 +10,7 @@ import re
 import time
 from types import SimpleNamespace
 
-from . import diagnostics, hot_head, rendezvous, vision
+from . import diagnostics, draft_graph, hot_head, rendezvous, vision
 from .parsing import SchemaValidationError, StreamParser, canonical, image_parts, message_key, validate_messages, validate_tools
 from .rendering import REASONING_CLOSE, Prompt, encode, render
 
@@ -711,12 +711,35 @@ class ExLlamaBackend:
                     self._hot_head = {"installed": True, **hot_head.install(self.generator)}
                 except Exception:
                     self._hot_head = {"installed": False, "error": True}
+            # Draft-loop CUDA graph (promoted 2026-09-23): one graph replay per
+            # verify replaces the per-step host dispatch of the draft walk
+            # (-0.9..-1.1 ms/verify at 32K, +5.6% tok/s at 256K, memory delta 0).
+            # Requires the rendezvous GPU-chained walk and the hot64k head (the
+            # captured body feeds GPU ids to the draft forward). Falls back to
+            # the eager walk per batch whenever the shape is unsupported, and
+            # never breaks the boot. QWASAR_DRAFT_GRAPH=0 disables it;
+            # QWASAR_DRAFT_GRAPH_VALIDATE=N cross-checks the first N verifies.
+            self._draft_graph = {"installed": False, "disabled": True}
+            if draft_graph.enabled():
+                if self._rendezvous.get("installed") and self._hot_head.get("installed"):
+                    try:
+                        graph = draft_graph.install(self.generator)
+                        self._draft_graph_obj = graph
+                        self._draft_graph = {"installed": True,
+                                             "revision": draft_graph.REVISION,
+                                             "validate_verifies": graph.validate_left}
+                    except Exception:
+                        self._draft_graph = {"installed": False, "error": True}
+                else:
+                    self._draft_graph = {"installed": False, "unavailable": True}
         except Exception:
             self._lifetime.close()
             raise
         if self._hot_head.get("installed"):
             identity_body["mtp_proposer_head"] = {"revision": hot_head.REVISION,
                                                   "map_sha256": hot_head.MAP_SHA256}
+        if self._draft_graph.get("installed"):
+            identity_body["draft_graph"] = {"revision": draft_graph.REVISION}
         self.identity = hashlib.sha256(canonical(identity_body).encode()).hexdigest()
         self.end_token = encode(self.tokenizer, "<|im_end|>")[0]
         self.draft_tokens = self.generator.num_draft_tokens
@@ -738,7 +761,8 @@ class ExLlamaBackend:
             "target_cache": ("NVFP4 one-level (global scale 1, page 256)" if xqa is not None else "K8/V4"),
             "mlp_graphs": hybrid.EXPECTED_GRAPHS if hybrid else 0,
             "rendezvous": self._rendezvous,
-            "mtp_head": self._hot_head}
+            "mtp_head": self._hot_head,
+            "draft_graph": self._draft_graph}
 
     def start(self, tokens, request):
         import torch
