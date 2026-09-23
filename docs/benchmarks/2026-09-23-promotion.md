@@ -79,7 +79,23 @@ cp $SP/exllamav3/exllamav3_ext/gdn.cu{.orig-pre-determinism,}
 systemctl --user restart qwasar.service
 ```
 
-## 5. Pendiente (no bloquea)
+## 5. Incidente post-promoción (mismo día, resuelto)
+
+A los ~10 min de uso real (sesión de droid con prompts largos) el worker logueó
+dos OOM transitorios (bloques de 96/272 MB con ~85 MB libres). El allocator
+purgó su caché y reintentó: sin traceback, sin caída, pero el request en vuelo
+se congeló. Diagnóstico: la pila opera por diseño a ~100 MiB del límite del
+dispositivo; el allocator nativo fragmentado no pudo servir un bloque contiguo
+grande. Las promociones no fueron la causa material (el grafo retiene unos MB;
+el parche GDN usa shared memory) — el margen se lo comió el caché del
+allocator tras tráfico de 32-35K (smoke tests incluidos).
+
+Fix aplicado: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` en
+`integrations/systemd/qwasar.service` (+ daemon-reload + restart). Verificado
+en el environ del worker y sin costo: 290 tok/s warm, aceptación 0.84,
+`draft_graph` instalado.
+
+## 6. Pendiente (no bloquea)
 
 - El parche GDN es upstreamable a MiaAI-Lab/exllamav3 (4 sitios, misma
   estructura de kernel; overhead medido ≈ 0).

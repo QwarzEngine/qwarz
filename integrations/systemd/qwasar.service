@@ -12,6 +12,11 @@ Environment="QWASAR_MODEL_PATH=%h/models/Qwen3.8-27B-EXL3-5.0bpw"
 Environment="QWASAR_EXLLAMA_PYTHON=%h/Documents/llm/qwen38-exl3-mia/.venv/bin/python"
 Environment="HF_HUB_OFFLINE=1"
 Environment="PYTHONUNBUFFERED=1"
+# 2026-09-23: the 262K-context stack rides within ~100 MiB of device-full; the
+# native caching allocator's fragmentation turned that into transient OOMs on
+# long prompts. Expandable segments grow in place instead of requiring fresh
+# contiguous blocks.
+Environment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 ExecStart=/usr/bin/python3 %h/Documents/llm/qwarz/scripts/qwasar.py serve --prefill xqa
 ExecStartPost=/usr/bin/python3 %h/Documents/llm/qwasar/scripts/qwasar.py wait-ready --pid ${MAINPID}
 Restart=on-failure
