@@ -125,6 +125,22 @@ and `results/20260922-hot64k-xqa/report.md` (local artifacts).
 
 ## Use it
 
+One command on any Linux box with an RTX 5090:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/QwarzEngine/qwarz/master/scripts/install.sh)
+```
+
+The script clones the engine into `~/Documents/llm/qwarz` (or fast-forwards
+an existing clone, falling back to the current checkout if the tree is
+dirty), builds the `qwarz` CLI and hands control to `qwarz start`. Flags
+pass through: `bash <(curl -fsSL ...) --gpu 1 --download`. It does not
+install the Rust toolchain, CUDA or the ExLlamaV3 runtime venv (the sibling
+`qwen38-exl3-mia` checkout); whatever is missing, `qwarz start` fails fast
+with the exact instruction.
+
+From an existing checkout:
+
 ```bash
 cd /home/rekeyea/Documents/llm/qwarz
 cargo run --release --locked -p qwarz -- start   # installs the service and the `qwarz` command
