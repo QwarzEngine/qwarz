@@ -41,6 +41,11 @@ start options:
 }
 
 fn main() {
+    // Rust ignores SIGPIPE by default, so piping into `head`/`less -q` would
+    // print a broken-pipe panic; a Unix CLI should just die quietly.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let mut arguments = std::env::args().skip(1);
     let Some(command) = arguments.next() else {
         usage();
