@@ -37,28 +37,39 @@ def run_invalid(directory, raw=RAW):
 def test_validation_error_locates_nested_field_without_values():
     parser = StreamParser('off', TOOLS, 'resp_test')
     parser.feed(RAW)
-    with pytest.raises(ValueError) as failure:
-        parser.finish()
-    assert failure.value.path == ['options', 0]
-    assert failure.value.actual_type == 'object'
-    assert failure.value.expected_type == 'string'
-    assert 'PRIVATE_VALUE' not in str(failure.value)
+    message = parser.finish()
+    assert len(message['tool_calls']) == 1
+    assert json.loads(message['tool_calls'][0]['function']['arguments'])['options'] == [
+        {'secret': 'PRIVATE_VALUE', 'other': True}]
+    assert len(parser.validation_failures) == 1
+    failure = parser.validation_failures[0]
+    assert failure['validation']['path'] == ['options', 0]
+    assert failure['validation']['actual_type'] == 'object'
+    assert failure['validation']['expected_type'] == 'string'
+    assert 'PRIVATE_VALUE' not in failure['error']['message']
 
 
 def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path):
     directory = tmp_path / 'diagnostics'
     engine, backend, events = run_invalid(directory)
     terminal = events[-1]
-    assert terminal['status'] == 'incomplete'
-    assert terminal['snapshot'] is None
+    assert terminal['status'] == 'completed'
+    assert terminal['snapshot'] is not None
     assert terminal['error'] is None
-    assert terminal['message']['tool_calls'] == []
-    assert terminal['metrics']['incomplete_reason'] == 'invalid_tool_arguments'
+    assert len(terminal['message']['tool_calls']) == 1
+    call = terminal['message']['tool_calls'][0]
+    assert call['function']['name'] == 'ask_user_question'
+    assert json.loads(call['function']['arguments'])['options'] == [
+        {'secret': 'PRIVATE_VALUE', 'other': True}]
+    assert terminal['metrics']['incomplete_reason'] is None
     assert terminal['metrics']['tool_error'] == {'stage': 'schema_validation', 'tool': 'ask_user_question',
                                                 'call_index': 0, 'error': 'expected string'}
-    assert 'PRIVATE_VALUE' not in json.dumps(events)
+    # Pass-through delivers the argument values to the client, but the
+    # protocol-visible metrics stay value-free.
+    assert 'PRIVATE_VALUE' not in json.dumps(terminal['metrics'])
     record = json.loads(next(directory.glob('*.json')).read_text())
     assert record['raw_tool_calls'] == RAW
+    assert record['delivery'] == 'passed_to_client'
     assert record['tool_schemas']['ask_user_question'] == TOOLS[0]['function']['parameters']
     assert record['parsed_arguments']['options'] == [{'secret': 'PRIVATE_VALUE', 'other': True}]
     assert record['validation']['path'] == ['options', 0]
@@ -78,12 +89,13 @@ def test_engine_captures_exact_evidence_without_exposing_it_in_protocol(tmp_path
     assert len(list(directory.glob('*.json'))) == 1
 
 
-def test_capture_failure_does_not_mask_original_error(tmp_path):
+def test_capture_failure_does_not_break_delivery(tmp_path):
     with patch('qwasar_runtime.diagnostics.save_diagnostic', side_effect=OSError('PRIVATE_PATH')):
         _, _, events = run_invalid(tmp_path)
-    assert events[-1]['status'] == 'incomplete'
+    assert events[-1]['status'] == 'completed'
     assert events[-1]['error'] is None
-    assert 'PRIVATE_PATH' not in json.dumps(events)
+    assert events[-1]['metrics']['tool_error']['stage'] == 'schema_validation'
+    assert 'PRIVATE_PATH' not in json.dumps(events[-1]['metrics'])
 
 
 def test_malformed_native_call_is_captured(tmp_path):
@@ -178,14 +190,31 @@ def test_label_options_are_coerced_instead_of_failing(tmp_path):
 def test_capture_can_be_disabled():
     _, _, events = run_invalid(None)
     assert events[-1]['error'] is None
-    assert events[-1]['status'] == 'incomplete'
+    assert events[-1]['status'] == 'completed'
+    assert events[-1]['metrics']['tool_error']['stage'] == 'schema_validation'
 
 
 def test_malformed_second_call_does_not_publish_first_call(tmp_path):
     raw = ('<tool_call><function=ask_user_question><parameter=question>Choose</parameter>'
-           '</function></tool_call>' + RAW)
+           '</function></tool_call>' + '<tool_call>broken</tool_call>')
     _, _, events = run_invalid(tmp_path, raw)
     record = json.loads(next(tmp_path.glob('*.json')).read_text())
     assert record['call_index'] == 1
     assert record['raw_tool_calls'] == raw
+    assert events[-1]['status'] == 'incomplete'
     assert events[-1]['message']['tool_calls'] == []
+
+
+def test_schema_invalid_second_call_publishes_both_calls(tmp_path):
+    raw = ('<tool_call><function=ask_user_question><parameter=question>Choose</parameter>'
+           '</function></tool_call>' + RAW)
+    _, _, events = run_invalid(tmp_path, raw)
+    terminal = events[-1]
+    assert terminal['status'] == 'completed'
+    assert len(terminal['message']['tool_calls']) == 2
+    assert terminal['metrics']['tool_error'] == {'stage': 'schema_validation', 'tool': 'ask_user_question',
+                                                'call_index': 1, 'error': 'expected string'}
+    record = json.loads(next(tmp_path.glob('*.json')).read_text())
+    assert record['call_index'] == 1
+    assert record['stage'] == 'schema_validation'
+    assert record['delivery'] == 'passed_to_client'

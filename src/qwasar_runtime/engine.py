@@ -321,6 +321,9 @@ class Engine:
                     incomplete_reason = incomplete_reason_from_error(error, final)
                 tool_error = self._capture_incomplete_tools(parser, response_id, prompt, error)
                 message = parser.finish(complete=False)
+            else:
+                if parser.validation_failures:
+                    tool_error = self._capture_passed_validation_failures(parser, response_id, prompt)
             for channel, field in (("content", "content"), ("reasoning", "reasoning_content")):
                 tail = message[field][streamed_characters[channel]:]
                 if tail:
@@ -409,6 +412,29 @@ class Engine:
             except Exception:
                 pass
         return evidence
+
+    def _capture_passed_validation_failures(self, parser, response_id, prompt):
+        """Persists evidence for tool calls that failed schema validation but were
+        still delivered to the client (pass-through), and returns the first one
+        for the terminal metrics.
+
+        The client validates the call itself and feeds the rejection back to the
+        model, so the turn stays completed; the evidence is marked with
+        `delivery: passed_to_client` to distinguish it from dropped-call captures.
+        """
+        first = None
+        for evidence in parser.validation_failures:
+            record = {**evidence, "response_id": response_id, "runtime_identity": self.backend.identity,
+                      "parser_sha256": self.parser_sha256, "thinking": prompt.request["thinking"],
+                      "tool_choice": prompt.request["tool_choice"], "delivery": "passed_to_client"}
+            if first is None:
+                first = record
+            if self.diagnostic_directory is not None:
+                try:
+                    diagnostics.save_diagnostic(self.diagnostic_directory, record)
+                except Exception:
+                    pass
+        return first
 
 
 class FakeTokenizer:

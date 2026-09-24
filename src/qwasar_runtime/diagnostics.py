@@ -69,18 +69,32 @@ def replay_diagnostic(path):
               'parser_matches_capture': record['parser_sha256'] == hashlib.sha256(
                   Path(__file__).with_name('parsing.py').read_bytes()).hexdigest()}
     validation = None
+    parsed_arguments = None
     try:
         parser.finish()
-        report['accepted'] = True
     except ValueError as error:
         report['error_class'] = type(error).__name__
         if isinstance(error, SchemaValidationError):
             validation = {'path': error.path, 'expected_type': error.expected_type,
                           'actual_type': error.actual_type}
+        if parser.tool_diagnostic is not None:
+            parsed_arguments = parser.tool_diagnostic['parsed_arguments']
+    else:
+        # Schema validation failures pass through since parser revision with
+        # `validation_failures`: the call is delivered but still not "accepted".
+        failures = parser.validation_failures
+        if failures:
+            match = next((failure for failure in failures
+                          if failure.get('call_index') == record.get('call_index')), failures[0])
+            report['error_class'] = (match.get('error') or {}).get('class')
+            validation = match.get('validation')
+            parsed_arguments = match.get('parsed_arguments')
+        else:
+            report['accepted'] = True
     report['validation'] = validation
     report['validation_matches'] = not report['accepted'] and validation == record.get('validation')
-    report['parsed_arguments_match'] = (parser.tool_diagnostic is not None and
-        parser.tool_diagnostic['parsed_arguments'] == record['parsed_arguments'])
+    report['parsed_arguments_match'] = (parsed_arguments is not None and
+        parsed_arguments == record['parsed_arguments'])
     return report
 
 

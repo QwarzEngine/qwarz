@@ -551,6 +551,7 @@ class StreamParser:
         self.leading = ""
         self.in_tools = False
         self.tool_diagnostic = None
+        self.validation_failures = []
 
     def feed(self, text):
         if self.in_tools:
@@ -650,7 +651,17 @@ class StreamParser:
                 arguments = coerce_arguments(arguments, schema)
                 self.tool_diagnostic["parsed_arguments"] = arguments
                 self.tool_diagnostic["stage"] = "schema_validation"
-                validate_value(arguments, schema)
+                try:
+                    validate_value(arguments, schema)
+                except SchemaValidationError as error:
+                    # Pass-through: deliver the call with its arguments anyway so
+                    # the client's own validator can reject it and feed the error
+                    # back to the model; dropping it here produced turns with no
+                    # visible output and no tool calls. Keep bounded evidence.
+                    self.validation_failures.append({**self.tool_diagnostic,
+                        "error": {"class": type(error).__name__, "message": str(error)},
+                        "validation": {"path": error.path, "expected_type": error.expected_type,
+                                       "actual_type": error.actual_type}})
                 call_id = "call_" + hashlib.sha256(f"{self.response_id}:{len(calls)}".encode()).hexdigest()[:24]
                 calls.append({"id": call_id, "type": "function", "function": {
                     "name": name, "arguments": canonical(arguments)}})

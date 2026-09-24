@@ -32,13 +32,27 @@ class ParserTests(unittest.TestCase):
         parser.feed('print("<tool_call>")')
         self.assertEqual(parser.finish()["content"], 'print("<tool_call>")')
 
-    def test_duplicate_and_wrong_type_parameters_rejected(self):
-        for arguments in ('<parameter=path>a</parameter><parameter=path>b</parameter>',
-                          '<parameter=path>a</parameter><parameter=edits>12</parameter>'):
-            parser = StreamParser("off", TOOLS, "resp_a")
-            parser.feed('<tool_call><function=edit>' + arguments + '</function></tool_call>')
-            with self.assertRaises(ValueError):
-                parser.finish()
+    def test_duplicate_parameters_are_rejected(self):
+        parser = StreamParser("off", TOOLS, "resp_a")
+        parser.feed('<tool_call><function=edit><parameter=path>a</parameter><parameter=path>b</parameter>'
+                    '</function></tool_call>')
+        with self.assertRaises(ValueError):
+            parser.finish()
+
+    def test_wrong_type_parameters_pass_through_with_evidence(self):
+        parser = StreamParser("off", TOOLS, "resp_a")
+        parser.feed('<tool_call><function=edit><parameter=path>a</parameter><parameter=edits>12</parameter>'
+                    '</function></tool_call>')
+        message = parser.finish()
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]),
+                         {"path": "a", "edits": 12})
+        self.assertEqual(len(parser.validation_failures), 1)
+        failure = parser.validation_failures[0]
+        self.assertEqual(failure["stage"], "schema_validation")
+        self.assertEqual(failure["tool"], "edit")
+        self.assertEqual(failure["validation"]["path"], ["edits"])
+        self.assertEqual(failure["validation"]["expected_type"], "array")
+        self.assertEqual(failure["error"]["class"], "SchemaValidationError")
 
     def test_tool_results_must_correspond_and_be_unique(self):
         with self.assertRaises(ValueError):
