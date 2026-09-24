@@ -1,0 +1,12 @@
+[package]
+name = "qwarz"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "qwarz"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0.151"
+sha2 = "0.11.0"

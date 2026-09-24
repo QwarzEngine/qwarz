@@ -127,8 +127,23 @@ and `results/20260922-hot64k-xqa/report.md` (local artifacts).
 
 ```bash
 cd /home/rekeyea/Documents/llm/qwarz
-python3 scripts/qwasar.py start    # also: status, logs, stop
+cargo run --release --locked -p qwarz -- start   # installs the service and the `qwarz` command
 ```
+
+```bash
+qwarz start      # install/refresh: GPU check, artifact hashes, build, systemd unit; idempotent
+qwarz status     # service status                 qwarz logs    — follow the journal
+qwarz stop       # stop the service
+qwarz explain    # every engine decision, its measurement, its rollback switch, and this boot's live state
+```
+
+`qwarz start` detects the GPUs (RTX 5090 only; processes holding the GPU
+block it unless they are the running qwasar service, which it restarts),
+validates the runtime venv and CUDA, verifies the pinned EXL3 artifact and
+NVFP4 donor by SHA-256 (or downloads them with `--download`), builds the
+server, installs/refreshes the systemd user unit and waits for the worker.
+Non-default paths (`--gpu N`, `--model`, `--python`, `--donor`) generate a
+unit with explicit overrides.
 
 Endpoint `http://127.0.0.1:8800/v1`, model `qwasar-qwen38-27b`. Inline image
 data URLs are accepted in user messages. One GPU worker: concurrent requests

@@ -31,17 +31,23 @@ def systemd_command(command, profile):
     return ["systemctl", "--user", command, "qwasar.service"]
 
 
+def cuda_device():
+    value = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    return value if value.isdigit() and int(value) >= 0 else "0"
+
+
 def check_gpu():
-    name = subprocess.check_output(["nvidia-smi", "-i", "0", "--query-gpu=name", "--format=csv,noheader"], text=True).strip()
+    device = cuda_device()
+    name = subprocess.check_output(["nvidia-smi", "-i", device, "--query-gpu=name", "--format=csv,noheader"], text=True).strip()
     if "RTX 5090" not in name:
-        raise RuntimeError(f"GPU 0 must be RTX 5090, found {name}")
-    processes = subprocess.check_output(["nvidia-smi", "-i", "0", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"], text=True)
+        raise RuntimeError(f"GPU {device} must be RTX 5090, found {name}")
+    processes = subprocess.check_output(["nvidia-smi", "-i", device, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"], text=True)
     for row in processes.splitlines():
         if not row.strip():
             continue
         process, memory = row.split(",", 1)
         if not memory.strip().isdigit() or int(memory) >= 512:
-            raise RuntimeError(f"GPU 0 is occupied by PID {process.strip()} ({memory.strip()} MiB); stop its owner explicitly first")
+            raise RuntimeError(f"GPU {device} is occupied by PID {process.strip()} ({memory.strip()} MiB); stop its owner explicitly first")
 
 
 def process_start(pid):
@@ -96,7 +102,7 @@ def serve(profile):
     os.set_inheritable(lock, True)
     check_gpu()
     python = os.environ.get("QWASAR_EXLLAMA_PYTHON", str(ROOT.parent / "qwen38-exl3-mia/.venv/bin/python"))
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="0", PYTHONPATH=str(ROOT / "src"))
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=cuda_device(), PYTHONPATH=str(ROOT / "src"))
     os.chdir(ROOT)
     os.execve(BINARY, [str(BINARY), "--python", python, "--database", str(STATE / "qwasar.db"), "--prefill", profile], environment)
 

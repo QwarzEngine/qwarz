@@ -479,6 +479,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwarz"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "qwasar-server"
 version = "0.1.0"
 dependencies = [
