@@ -156,7 +156,9 @@ qwarz explain    # every engine decision, its measurement, its rollback switch, 
 `qwarz start` detects the GPUs (RTX 5090 only; processes holding the GPU
 block it unless they are the running qwasar service, which it restarts),
 validates the runtime venv and CUDA, verifies the pinned EXL3 artifact and
-NVFP4 donor by SHA-256 (or downloads them with `--download`), builds the
+NVFP4 donor by SHA-256 — downloading either from Hugging Face when missing
+(~20 GB EXL3, ~22 GB donor), asking first on an interactive terminal or
+outright with `--download` — builds the
 server, installs/refreshes the systemd user unit and waits for the worker.
 Non-default paths (`--gpu N`, `--model`, `--python`, `--donor`) generate a
 unit with explicit overrides.

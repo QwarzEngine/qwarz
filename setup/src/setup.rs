@@ -9,7 +9,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -488,6 +488,19 @@ fn hf_cli(python: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Decides whether a missing artifact should be fetched: `--download`/`--yes`
+/// force it, an interactive terminal gets asked with the estimated size, and
+/// anything else falls back to the fail-fast hint.
+fn wants_download(options: &Options, description: &str) -> Result<bool, SetupError> {
+    if options.download || options.yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    Ok(confirm(&format!("download {description}")))
+}
+
 fn hf_download(cli: &Path, repository: &str, revision: &str, directory: &Path) -> Result<(), SetupError> {
     fs::create_dir_all(directory)?;
     println!("    downloading {repository} @ {revision} into {}", directory.display());
@@ -520,7 +533,8 @@ fn ensure_artifacts(resolved: &Resolved, options: &Options) -> Result<(), SetupE
         .to_string();
     let mut downloaded = false;
     if !resolved.model.is_dir() || !resolved.model.join("config.json").is_file() || !has_safetensors(&resolved.model) {
-        if !options.download {
+        let description = format!("the EXL3 artifact {EXL3_REPOSITORY} @ {EXL3_REVISION} (~20 GB)");
+        if !wants_download(options, &description)? {
             return Err(SetupError(format!(
                 "EXL3 artifact missing at {}; re-run with --download to fetch {EXL3_REPOSITORY} @ {EXL3_REVISION}",
                 resolved.model.display()
@@ -544,7 +558,11 @@ fn ensure_artifacts(resolved: &Resolved, options: &Options) -> Result<(), SetupE
         .ok_or_else(|| SetupError("donor manifest is missing repository".into()))?
         .to_string();
     if !resolved.donor.is_dir() {
-        if !options.download {
+        let bytes: u64 = donor["shards"]
+            .as_object()
+            .map_or(0, |shards| shards.values().map(|info| info["size"].as_u64().unwrap_or(0)).sum());
+        let description = format!("the NVIDIA64 NVFP4 donor {repository} @ {revision} (~{:.0} GB)", bytes as f64 / 1e9);
+        if !wants_download(options, &description)? {
             return Err(SetupError(format!(
                 "NVIDIA64 donor missing at {}; re-run with --download to fetch {repository} @ {revision}",
                 resolved.donor.display()

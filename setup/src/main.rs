@@ -33,7 +33,8 @@ start options:
   --donor PATH        NVIDIA64 NVFP4 donor directory
                       (default: $QWASAR_NVIDIA_DONOR or the path pinned in
                        benchmarks/manifests/nvidia-qwen38-27b-nvfp4.json)
-  --download          download missing artifacts from Hugging Face
+  --download          download missing artifacts from Hugging Face without
+                      asking (interactive runs are asked anyway)
   --skip-hashes       skip SHA-256 verification of large artifacts
   --yes, -y           do not prompt for confirmation
   --help              show this help"#
