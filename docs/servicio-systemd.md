@@ -80,8 +80,9 @@ del grupo de procesos de Qwasar. No afecta a procesos de otras unidades.
 
 ## Instalación y actualizaciones
 
-La unidad está preparada para la disposición actual bajo `~/Documents/llm` y
-`~/models`; no es una plantilla portable a cualquier directorio sin editarla.
+La unidad versionada está preparada para la disposición bajo `~/Documents/llm`
+y `~/models`. `qwarz start` escribe otra unidad cuando la GPU, el modelo, el
+venv o CUDA no coinciden con esa disposición.
 El entorno declara rutas de Python/CUDA y no depende de iniciar un shell
 interactivo, mise o el escritorio. No descarga pesos ni compila Rust al arrancar.
 

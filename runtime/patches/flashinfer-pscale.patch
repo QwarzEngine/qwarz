@@ -1,0 +1,36 @@
+--- a/flashinfer/cute_dsl/attention/fmha/sm120/fmha_prefill_fp8_tma.py
++++ b/flashinfer/cute_dsl/attention/fmha/sm120/fmha_prefill_fp8_tma.py
+@@ -1213,14 +1213,14 @@
+                     tile_sum1 = tile_sum1 + p1
+                 if cutlass.const_expr(self.is_causal):
+                     p_regs[k_frag * 2 + row_half] = cvt_f32x2_to_f8x2(
+-                        p1, p0, self.in_dtype
++                        p1 * 256.0, p0 * 256.0, self.in_dtype
+                     )
+                 elif cutlass.const_expr(k_frag % 2 == 0):
+                     p_even0 = p0
+                     p_even1 = p1
+                 else:
+                     p_regs[(k_frag // 2) * 2 + row_half] = cvt_f32x4_to_f8x4(
+-                        p_even0, p_even1, p0, p1, self.in_dtype
++                        p_even0 * 256.0, p_even1 * 256.0, p0 * 256.0, p1 * 256.0, self.in_dtype
+                     )
+ 
+             # Reduce tile_sum across the four lanes that own one Q row.
+@@ -1374,14 +1374,14 @@
+                 tile_sum1 = tile_sum1 + p1
+                 if cutlass.const_expr(self.is_causal and not uses_direct_p_pack):
+                     p_regs[k_frag * 2 + row_half] = cvt_f32x2_to_f8x2(
+-                        p1, p0, self.in_dtype
++                        p1 * 256.0, p0 * 256.0, self.in_dtype
+                     )
+                 elif cutlass.const_expr(k_frag % 2 == 0):
+                     p_even0 = p0
+                     p_even1 = p1
+                 else:
+                     p_regs[(k_frag // 2) * 2 + row_half] = cvt_f32x4_to_f8x4(
+-                        p_even0, p_even1, p0, p1, self.in_dtype
++                        p_even0 * 256.0, p_even1 * 256.0, p0 * 256.0, p1 * 256.0, self.in_dtype
+                     )
+ 
+             tile_sum = tile_sum0 + tile_sum1

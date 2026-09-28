@@ -27,8 +27,8 @@ start options:
                       default: the first RTX 5090 found
   --model PATH        EXL3 artifact directory
                       (default: $QWASAR_MODEL_PATH or ~/models/Qwen3.8-27B-EXL3-5.0bpw)
-  --python PATH       ExLlamaV3 venv python
-                      (default: $QWASAR_EXLLAMA_PYTHON or
+  --python PATH       ExLlamaV3 venv python; created and installed into when
+                      missing (default: $QWASAR_EXLLAMA_PYTHON or
                        ~/Documents/llm/qwen38-exl3-mia/.venv/bin/python)
   --donor PATH        NVIDIA64 NVFP4 donor directory
                       (default: $QWASAR_NVIDIA_DONOR or the path pinned in

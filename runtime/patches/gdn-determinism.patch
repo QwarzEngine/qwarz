@@ -1,0 +1,104 @@
+--- a/exllamav3/exllamav3_ext/gdn.cu
++++ b/exllamav3/exllamav3_ext/gdn.cu
+@@ -477,6 +477,11 @@
+     __shared__ float sh_q[MAX_HEAD_DIM];
+     __shared__ float sh_dot1[MAX_HEAD_DIM];
+     __shared__ float sh_dot2[MAX_HEAD_DIM];
++    // Deterministic cross-slice partials: one slot per (bt, t), reduced below in a
++    // fixed j order. The original shared-memory atomicAdd made the accumulation
++    // order (and thus the low mantissa bits) depend on warp scheduling.
++    __shared__ float sh_p1[SUBK][MAX_HEAD_DIM];
++    __shared__ float sh_p2[SUBK][MAX_HEAD_DIM];
+ 
+     // Iterate over sequence dim
+     for (int s = 0; s < seqlen; ++s)
+@@ -594,7 +599,18 @@
+                     for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
+                         sum = sum + *sh_k_rd * *rs_rd;
+                 }
+-                atomicAdd(sh_dot1 + t, sum);
++                sh_p1[bt][t] = sum;
++            }
++            __syncthreads();
++
++            // Fixed-order cross-slice reduction (was shared-memory atomicAdd)
++            if (t < v_chunk_dim && bt == 0)
++            {
++                float acc = sh_p1[0][t];
++                #pragma unroll
++                for (int j = 1; j < SUBK; ++j)
++                    acc += sh_p1[j][t];
++                sh_dot1[t] = acc;
+             }
+             __syncthreads();
+         }
+@@ -630,7 +646,18 @@
+                     v_out = v_out + *sh_q_rd * state;
+                 }
+             }
+-            atomicAdd(sh_dot2 + t, v_out);
++            sh_p2[bt][t] = v_out;
++        }
++        __syncthreads();
++
++        // Fixed-order cross-slice reduction (was shared-memory atomicAdd)
++        if (t < v_chunk_dim && bt == 0)
++        {
++            float acc = sh_p2[0][t];
++            #pragma unroll
++            for (int j = 1; j < SUBK; ++j)
++                acc += sh_p2[j][t];
++            sh_dot2[t] = acc;
+         }
+         __syncthreads();
+ 
+@@ -707,6 +734,9 @@
+     __shared__ float sh_q[HEAD_DIM];
+     __shared__ float sh_dot1[HEAD_DIM];
+     __shared__ float sh_dot2[HEAD_DIM];
++    // Deterministic cross-slice partials (see the generic kernel above)
++    __shared__ float sh_p1[SUBK][V_CHUNK_DIM];
++    __shared__ float sh_p2[SUBK][V_CHUNK_DIM];
+ 
+     for (int s = 0; s < seqlen; ++s)
+     {
+@@ -785,7 +815,18 @@
+                 for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++)
+                     sum = sum + *sh_k_rd * *rs_rd;
+             }
+-            atomicAdd(sh_dot1 + t, sum);
++            sh_p1[bt][t] = sum;
++        }
++        __syncthreads();
++
++        // Fixed-order cross-slice reduction (was shared-memory atomicAdd)
++        if (t < V_CHUNK_DIM && bt == 0)
++        {
++            float acc = sh_p1[0][t];
++            #pragma unroll
++            for (int j = 1; j < SUBK; ++j)
++                acc += sh_p1[j][t];
++            sh_dot1[t] = acc;
+         }
+         __syncthreads();
+ 
+@@ -812,7 +853,18 @@
+                     v_out = v_out + *sh_q_rd * state;
+                 }
+             }
+-            atomicAdd(sh_dot2 + t, v_out);
++            sh_p2[bt][t] = v_out;
++        }
++        __syncthreads();
++
++        // Fixed-order cross-slice reduction (was shared-memory atomicAdd)
++        if (t < V_CHUNK_DIM && bt == 0)
++        {
++            float acc = sh_p2[0][t];
++            #pragma unroll
++            for (int j = 1; j < SUBK; ++j)
++                acc += sh_p2[j][t];
++            sh_dot2[t] = acc;
+         }
+         __syncthreads();
+ 

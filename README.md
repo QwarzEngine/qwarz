@@ -135,9 +135,18 @@ The script clones the engine into `~/Documents/llm/qwarz` (or fast-forwards
 an existing clone, falling back to the current checkout if the tree is
 dirty), builds the `qwarz` CLI and hands control to `qwarz start`. Flags
 pass through: `bash <(curl -fsSL ...) --gpu 1 --download`. It does not
-install the Rust toolchain, CUDA or the ExLlamaV3 runtime venv (the sibling
-`qwen38-exl3-mia` checkout); whatever is missing, `qwarz start` fails fast
-with the exact instruction.
+install the Rust toolchain, the CUDA toolkit, Python 3.12 or the `patch`
+command; whatever of those is missing, `qwarz start` fails fast with the
+exact instruction.
+
+`qwarz start` does install the runtime when it is missing. On an interactive
+terminal it asks first (about 3 GB and a CUDA compile, typically 5–20
+minutes); `--yes` or `--download` skips the question. The venv is created at
+`~/Documents/llm/qwen38-exl3-mia/.venv` unless `--python` is set. Into it go
+PyTorch 2.14 (cu130), ExLlamaV3 `63b32f0` with the promoted GDN determinism
+patch, and — when the legacy FlashInfer trees are not already on disk —
+FlashInfer `af78f8fc` with the P×256 kernel patch plus CUTLASS DSL 4.7.1.
+A venv that already matches those hashes is left alone.
 
 From an existing checkout:
 
@@ -155,10 +164,10 @@ qwarz explain    # every engine decision, its measurement, its rollback switch, 
 
 `qwarz start` detects the GPUs (RTX 5090 only; processes holding the GPU
 block it unless they are the running qwasar service, which it restarts),
-validates the runtime venv and CUDA, verifies the pinned EXL3 artifact and
-NVFP4 donor by SHA-256 — downloading either from Hugging Face when missing
-(~20 GB EXL3, ~22 GB donor), asking first on an interactive terminal or
-outright with `--download` — builds the
+installs or validates the runtime venv and CUDA, verifies the pinned EXL3
+artifact and NVFP4 donor by SHA-256 — downloading either from Hugging Face
+when missing (~20 GB EXL3, ~22 GB donor), asking first on an interactive
+terminal or outright with `--download` — builds the
 server, installs/refreshes the systemd user unit and waits for the worker.
 Non-default paths (`--gpu N`, `--model`, `--python`, `--donor`) generate a
 unit with explicit overrides.

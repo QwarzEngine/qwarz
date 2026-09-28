@@ -12,8 +12,8 @@
 #
 # Prerequisites this script does NOT install (qwarz start fails fast with the
 # exact instruction for whatever is missing): the Rust toolchain (rustup),
-# CUDA with nvcc, and the ExLlamaV3 runtime venv — normally the sibling
-# qwen38-exl3-mia checkout under ~/Documents/llm.
+# a CUDA toolkit with nvcc, and Python 3.12. The ExLlamaV3 venv, the GDN
+# determinism patch and FlashInfer are installed by `qwarz start` when absent.
 set -euo pipefail
 
 QWASAR_HOME="${QWASAR_HOME:-$HOME/Documents/llm}"

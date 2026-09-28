@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import sys
 
+from .runtime_contract import installed_flashinfer_ready
+
 
 ROOT = Path(__file__).resolve().parents[2]
 PIN_PATH = ROOT / "benchmarks/manifests/nvidia-qwen38-27b-nvfp4.json"
@@ -58,21 +60,35 @@ def verify_donor():
 
 
 def prepare_environment():
-    missing = [str(path) for path in FLASHINFER_PATHS if not path.is_dir()]
-    if missing:
-        raise ValueError("FlashInfer hybrid trees missing: " + ", ".join(missing))
-    for path in reversed(FLASHINFER_PATHS):
-        text = str(path)
-        if text in sys.path:
-            sys.path.remove(text)
-        sys.path.insert(0, text)
-    os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", str(WORKSPACE))
-    prefixes = []
+    if all(path.is_dir() for path in FLASHINFER_PATHS):
+        for path in reversed(FLASHINFER_PATHS):
+            text = str(path)
+            if text in sys.path:
+                sys.path.remove(text)
+            sys.path.insert(0, text)
+        os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", str(WORKSPACE))
+    elif installed_flashinfer_ready():
+        workspace = ROOT / "state" / "flashinfer-workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", str(workspace))
+    else:
+        raise ValueError(
+            "FlashInfer runtime is not installed. Run `qwarz start` to install "
+            "FlashInfer 0.6.18 with the P×256 patch into the ExLlamaV3 venv"
+        )
+    _extend_path()
+
+
+def _extend_path():
     current = os.environ.get("PATH", "")
     parts = current.split(":") if current else []
-    for prefix in (str(Path.home() / "Documents/llm/qwen38-exl3-mia/.venv/bin"), "/opt/cuda/bin"):
-        if prefix not in parts:
-            prefixes.append(prefix)
+    candidates = [str(Path(sys.executable).resolve().parent)]
+    candidates.append(str(Path.home() / "Documents/llm/qwen38-exl3-mia/.venv/bin"))
+    cuda_home = os.environ.get("CUDA_HOME")
+    if cuda_home:
+        candidates.append(str(Path(cuda_home) / "bin"))
+    candidates.append("/opt/cuda/bin")
+    prefixes = [prefix for prefix in candidates if prefix and prefix not in parts]
     if prefixes:
         os.environ["PATH"] = ":".join(prefixes + ([current] if current else []))
 

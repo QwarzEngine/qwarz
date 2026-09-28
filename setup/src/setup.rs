@@ -24,13 +24,6 @@ const DEFAULT_MODEL: &str = "models/Qwen3.8-27B-EXL3-5.0bpw";
 const DEFAULT_DONOR: &str = "models/nvidia-qwen38-27b-nvfp4";
 const DEFAULT_PYTHON: &str = "Documents/llm/qwen38-exl3-mia/.venv/bin/python";
 const DEFAULT_REPO: &str = "Documents/llm/qwarz";
-const FLASHINFER_PATHS: &[&str] = &[
-    "results/20260908-upstream-experiments/fp8/pscaled",
-    "results/20260908-upstream-experiments/fp8/deps",
-    "results/20260908-upstream-experiments/fp8/deps/nvidia_cutlass_dsl/dsl_packages",
-    "results/20260908-hybrid-backends/flashinfer-deps",
-    "results/20260908-hybrid-backends/flashinfer-deps/nvidia_cutlass_dsl/dsl_packages",
-];
 const UNIT_NAME: &str = "qwasar.service";
 const HOST: &str = "127.0.0.1";
 const PORT: u16 = 8800;
@@ -66,6 +59,7 @@ impl From<std::io::Error> for SetupError {
     }
 }
 
+#[derive(Clone)]
 struct Gpu {
     index: u32,
     uuid: String,
@@ -74,6 +68,7 @@ struct Gpu {
     driver: String,
 }
 
+#[derive(Clone)]
 struct Resolved {
     repo: PathBuf,
     home: PathBuf,
@@ -90,9 +85,9 @@ pub fn start(options: &Options) -> Result<(), SetupError> {
     let home = home_directory()?;
     println!("==> [1/6] Hardware");
     let gpu = detect_gpu(options)?;
-    let resolved = resolve(&repo, &home, options, gpu)?;
+    let mut resolved = resolve(&repo, &home, options, gpu)?;
     println!("==> [2/6] Environment");
-    validate_environment(&resolved)?;
+    validate_environment(&mut resolved, options)?;
     println!("==> [3/6] Model artifacts");
     ensure_artifacts(&resolved, options)?;
     println!("==> [4/6] Build");
@@ -418,10 +413,104 @@ fn locate_cuda() -> Option<PathBuf> {
     (fallback.join("bin/nvcc").is_file()).then_some(fallback)
 }
 
-fn validate_environment(resolved: &Resolved) -> Result<(), SetupError> {
+fn system_python() -> Result<PathBuf, SetupError> {
+    for name in ["python3", "python3.12"] {
+        let output = Command::new(name).arg("-c").arg("import sys; print(sys.executable)").output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Ok(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    Err(SetupError("python3 is required to inspect and install the runtime".into()))
+}
+
+fn contract_line(resolved: &Resolved) -> Result<(bool, String), SetupError> {
+    let script = resolved.repo.join("scripts/bootstrap_runtime.py");
+    let output = Command::new(system_python()?)
+        .arg(&script)
+        .arg("check")
+        .arg("--python")
+        .arg(&resolved.python)
+        .arg("--repo")
+        .arg(&resolved.repo)
+        .output()
+        .map_err(|error| SetupError(format!("cannot run {}: {error}", script.display())))?;
+    let detail = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let code = output.status.code();
+    if code == Some(0) {
+        return Ok((true, detail));
+    }
+    if code == Some(10) {
+        return Ok((false, detail));
+    }
+    let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(SetupError(format!(
+        "runtime check failed (exit {}): {}",
+        output.status,
+        if error.is_empty() { detail } else { error }
+    )))
+}
+
+fn ensure_runtime(resolved: &mut Resolved, options: &Options) -> Result<(), SetupError> {
+    let (ready, detail) = contract_line(resolved)?;
+    if ready {
+        println!("    {detail}");
+        return Ok(());
+    }
+    let description = "the Qwen runtime into the ExLlamaV3 venv (PyTorch, ExLlamaV3 and FlashInfer; about 3 GB plus a CUDA compile, typically 5–20 minutes)";
+    if !wants_download(options, &description)? {
+        return Err(SetupError(format!(
+            "runtime is incomplete ({detail}). Re-run `qwarz start --yes` to install it"
+        )));
+    }
+    println!("    installing the runtime ({detail})");
+    let cuda_home = resolved.cuda_home.clone().ok_or_else(|| {
+        SetupError("CUDA toolkit not found (nvcc); the runtime compile needs nvcc".into())
+    })?;
+    let script = resolved.repo.join("scripts/bootstrap_runtime.py");
+    let status = Command::new(system_python()?)
+        .arg(&script)
+        .arg("install")
+        .arg("--python")
+        .arg(&resolved.python)
+        .arg("--repo")
+        .arg(&resolved.repo)
+        .arg("--cuda-home")
+        .arg(&cuda_home)
+        .status()?;
+    if !status.success() {
+        return Err(SetupError(format!(
+            "runtime install failed (exit {})",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    let (ready, detail) = contract_line(resolved)?;
+    if !ready {
+        return Err(SetupError(format!(
+            "runtime install finished but the contract is still open: {detail}"
+        )));
+    }
+    println!("    {detail}");
+    Ok(())
+}
+
+fn validate_environment(resolved: &mut Resolved, options: &Options) -> Result<(), SetupError> {
+    capture("cargo", &["--version"])
+        .map_err(|_| SetupError("cargo is not in PATH; install the Rust toolchain from https://rustup.rs".into()))?;
+    if resolved.cuda_home.is_none() {
+        return Err(SetupError(
+            "CUDA toolkit not found (nvcc); the PRIMS/XQA prefill stack needs nvcc".into(),
+        ));
+    }
+    println!("    CUDA toolkit at {}", resolved.cuda_home.as_ref().unwrap().display());
+    ensure_runtime(resolved, options)?;
     if !resolved.python.is_file() {
         return Err(SetupError(format!(
-            "ExLlamaV3 venv python not found at {}; set --python or QWASAR_EXLLAMA_PYTHON (the runtime venv normally comes from the sibling qwen38-exl3-mia checkout)",
+            "ExLlamaV3 venv python not found at {}; set --python or QWASAR_EXLLAMA_PYTHON",
             resolved.python.display()
         )));
     }
@@ -438,35 +527,11 @@ fn validate_environment(resolved: &Resolved) -> Result<(), SetupError> {
     println!("    Python {major}.{minor} at {}", resolved.python.display());
     capture(&resolved.python.to_string_lossy(), &["-c", "import exllamav3"]).map_err(|_| {
         SetupError(format!(
-            "exllamav3 is not importable in {}; rebuild the sibling qwen38-exl3-mia venv before installing",
+            "exllamav3 is not importable in {} after the runtime install",
             resolved.python.display()
         ))
     })?;
     println!("    exllamav3 imports cleanly");
-    capture("cargo", &["--version"])
-        .map_err(|_| SetupError("cargo is not in PATH; install the Rust toolchain".into()))?;
-    let cuda_home = resolved.cuda_home.clone().ok_or_else(|| {
-        SetupError("CUDA toolkit not found (nvcc); the PRIMS/XQA prefill stack needs nvcc".into())
-    })?;
-    println!("    CUDA toolkit at {}", cuda_home.display());
-    let mut missing = Vec::new();
-    for relative in FLASHINFER_PATHS {
-        let path = resolved.repo.join(relative);
-        if !path.is_dir() {
-            missing.push(path);
-        }
-    }
-    if !missing.is_empty() {
-        let listed = missing
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(SetupError(format!(
-            "FlashInfer hybrid trees missing: {listed}; they ship with the lever campaigns (see docs/benchmarks/2026-09-20-serving-evaluation.md)"
-        )));
-    }
-    println!("    FlashInfer hybrid trees: {}/{} present", FLASHINFER_PATHS.len(), FLASHINFER_PATHS.len());
     Ok(())
 }
 
@@ -886,7 +951,7 @@ fn print_summary(resolved: &Resolved) {
         .unwrap_or("unknown");
     println!(
         r#"
-Qwasar is running.
+Qwarz is running.
 
   GPU:      {} (GPU {}, {} MiB, driver {})
   Model:    {EXL3_REPOSITORY} @ {} (5.0 bpw) — {}
