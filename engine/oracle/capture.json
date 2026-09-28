@@ -1,0 +1,87 @@
+{
+  "seed": 20260928,
+  "id_range": [
+    1000,
+    20000
+  ],
+  "taps": {
+    "gdn": "model.language_model.layers.0.linear_attn",
+    "attention": "model.language_model.layers.3.self_attn",
+    "mlp": "model.language_model.layers.0.mlp",
+    "embedding": "model.language_model.embed_tokens"
+  },
+  "contexts": [
+    {
+      "length": 64,
+      "greedy_token": 198,
+      "first_ids": [
+        16412,
+        18750,
+        10617,
+        4324,
+        11570,
+        7174,
+        7945,
+        3834
+      ],
+      "last_ids": [
+        5628,
+        12342,
+        12508,
+        17951,
+        18951,
+        8157,
+        3346,
+        4105
+      ]
+    },
+    {
+      "length": 32768,
+      "greedy_token": 317,
+      "first_ids": [
+        16412,
+        18750,
+        10617,
+        4324,
+        11570,
+        7174,
+        7945,
+        3834
+      ],
+      "last_ids": [
+        19903,
+        13467,
+        1819,
+        4513,
+        18415,
+        9552,
+        18598,
+        7167
+      ]
+    },
+    {
+      "length": 261888,
+      "greedy_token": 317,
+      "first_ids": [
+        16412,
+        18750,
+        10617,
+        4324,
+        11570,
+        7174,
+        7945,
+        3834
+      ],
+      "last_ids": [
+        6330,
+        4262,
+        9308,
+        11689,
+        7046,
+        3741,
+        9192,
+        6884
+      ]
+    }
+  ]
+}

@@ -470,6 +470,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "q38-worker"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -483,6 +491,7 @@ name = "qwarz"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rusqlite",
  "serde_json",
  "sha2",
 ]

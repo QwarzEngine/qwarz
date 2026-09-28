@@ -229,7 +229,7 @@ fn home_directory() -> Result<PathBuf, SetupError> {
         .ok_or_else(|| SetupError("HOME is not set".into()))
 }
 
-fn discover_repo() -> Result<PathBuf, SetupError> {
+pub(crate) fn discover_repo() -> Result<PathBuf, SetupError> {
     let mut candidates = Vec::new();
     if let Ok(executable) = std::env::current_exe() {
         candidates.extend(executable.ancestors().map(Path::to_path_buf));

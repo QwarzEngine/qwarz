@@ -12,6 +12,7 @@ benchmarks/baselines/
 .idea/
 .vscode/
 target/
+engine/cuda/*.so
 state/
 .env
 .env.*

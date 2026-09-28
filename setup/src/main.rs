@@ -1,8 +1,10 @@
+mod monitor;
 mod setup;
+mod stats;
 
 use setup::Options;
 
-const DELEGATED: [&str; 7] = ["serve", "stop", "status", "logs", "stats", "monitor", "wait-ready"];
+const DELEGATED: [&str; 5] = ["serve", "stop", "status", "logs", "wait-ready"];
 
 fn usage() {
     println!(
@@ -70,12 +72,9 @@ fn main() {
     match command.as_str() {
         "--help" | "-h" => usage(),
         "start" => run_start(&mut arguments),
-        "explain" => {
-            if let Err(error) = setup::explain() {
-                eprintln!("qwarz: {error}");
-                std::process::exit(1);
-            }
-        }
+        "explain" => finish(setup::explain()),
+        "stats" => finish(stats::execute(arguments)),
+        "monitor" => finish(monitor::execute(arguments)),
         other if DELEGATED.contains(&other) => setup::delegate(other, arguments),
         other => {
             eprintln!("qwarz: unknown command {other}");
@@ -108,6 +107,13 @@ fn run_start(arguments: &mut impl Iterator<Item = String>) {
         }
     }
     if let Err(error) = setup::start(&options) {
+        eprintln!("qwarz: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn finish(result: Result<(), setup::SetupError>) {
+    if let Err(error) = result {
         eprintln!("qwarz: {error}");
         std::process::exit(1);
     }
