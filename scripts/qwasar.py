@@ -178,9 +178,21 @@ def stats(arguments):
     ))
 
 
+def monitor(arguments):
+    sys.path.insert(0, str(ROOT / "src"))
+    from qwasar_runtime.monitor import parse_interval, run
+
+    interval = None if arguments.interval is None else parse_interval(arguments.interval)
+    samples = 1 if arguments.samples is None and interval is None else arguments.samples
+    try:
+        run(samples=samples, interval=interval, gpu=arguments.gpu, as_json=arguments.json)
+    except KeyboardInterrupt:
+        return
+
+
 def main():
     parser = argparse.ArgumentParser(description="Manage the dedicated local RTX 5090 Qwasar service")
-    parser.add_argument("command", choices=["start", "serve", "stop", "status", "logs", "stats", "wait-ready"])
+    parser.add_argument("command", choices=["start", "serve", "stop", "status", "logs", "stats", "monitor", "wait-ready"])
     parser.add_argument("--prefill", choices=["flash", "baseline", "xqa"], default="flash")
     parser.add_argument("--pid", type=int)
     parser.add_argument("--last", type=int, default=20, help="how many of the newest matching interactions to measure")
@@ -192,6 +204,9 @@ def main():
     parser.add_argument("--min-prefill", type=int, default=256, help="new prompt tokens required before a turn counts toward prefill tok/s")
     parser.add_argument("--json", action="store_true", help="print the measurement as JSON")
     parser.add_argument("--database", type=Path, help="interaction database (default: state/qwasar.db)")
+    parser.add_argument("--interval", help="time between hardware samples, e.g. 1s or 2s; repeats until interrupted")
+    parser.add_argument("--samples", type=int, help="how many hardware samples to take (default 1, or until interrupted with --interval)")
+    parser.add_argument("--gpu", type=int, help="GPU index to measure (default: the GPU running the worker)")
     arguments = parser.parse_args()
     if arguments.command == "wait-ready":
         if arguments.pid is None or arguments.pid <= 0:
@@ -200,6 +215,9 @@ def main():
         return
     if arguments.command == "stats":
         stats(arguments)
+        return
+    if arguments.command == "monitor":
+        monitor(arguments)
         return
     managed = systemd_command(arguments.command, arguments.prefill)
     if managed is not None:

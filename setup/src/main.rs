@@ -2,7 +2,7 @@ mod setup;
 
 use setup::Options;
 
-const DELEGATED: [&str; 6] = ["serve", "stop", "status", "logs", "stats", "wait-ready"];
+const DELEGATED: [&str; 7] = ["serve", "stop", "status", "logs", "stats", "monitor", "wait-ready"];
 
 fn usage() {
     println!(
@@ -29,6 +29,12 @@ commands:
                       --min-prompt N  --max-prompt N
                       --min-prefill N (default 256, prefill sample)
                       --json  --database PATH
+  monitor             GPU, power, temperature, CPU and memory for the machine
+                      running the worker
+                      --interval 1s   repeat until interrupted
+                      --samples N     stop after N samples (default 1)
+                      --gpu N         GPU index (default: the worker's GPU)
+                      --json
   serve, wait-ready   internal commands used by the systemd unit
 
 start options:

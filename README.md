@@ -159,6 +159,7 @@ cargo run --release --locked -p qwarz -- start   # installs the service and the 
 qwarz start      # install/refresh: GPU check, artifact hashes, build, systemd unit; idempotent
 qwarz status     # service status                 qwarz logs    — follow the journal
 qwarz stats      # tok/s, TTFT, prefill and acceptance over the newest interactions
+qwarz monitor    # GPU, power, temperature, CPU and memory on the machine running the worker
 qwarz stop       # stop the service
 qwarz explain    # every engine decision, its measurement, its rollback switch, and this boot's live state
 ```
