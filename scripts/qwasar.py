@@ -158,16 +158,48 @@ def stop():
     print("Qwasar stopped after termination timeout")
 
 
+def stats(arguments):
+    sys.path.insert(0, str(ROOT / "src"))
+    from qwasar_runtime.stats import report
+
+    if arguments.last < 1:
+        raise ValueError("--last must be at least 1")
+    database = arguments.database or (STATE / "qwasar.db")
+    print(report(
+        database,
+        last=arguments.last,
+        since=arguments.since,
+        status=arguments.status,
+        min_completion=arguments.min_completion,
+        min_prompt=arguments.min_prompt,
+        max_prompt=arguments.max_prompt,
+        min_prefill=arguments.min_prefill,
+        as_json=arguments.json,
+    ))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Manage the dedicated local RTX 5090 Qwasar service")
-    parser.add_argument("command", choices=["start", "serve", "stop", "status", "logs", "wait-ready"])
+    parser.add_argument("command", choices=["start", "serve", "stop", "status", "logs", "stats", "wait-ready"])
     parser.add_argument("--prefill", choices=["flash", "baseline", "xqa"], default="flash")
     parser.add_argument("--pid", type=int)
+    parser.add_argument("--last", type=int, default=20, help="how many of the newest matching interactions to measure")
+    parser.add_argument("--since", help="only interactions newer than this, e.g. 30m, 2h, 1d")
+    parser.add_argument("--status", default="completed,incomplete", help="comma-separated statuses, or all")
+    parser.add_argument("--min-completion", type=int, default=1, help="output tokens required before a turn counts toward decode tok/s")
+    parser.add_argument("--min-prompt", type=int, help="drop interactions with fewer prompt tokens")
+    parser.add_argument("--max-prompt", type=int, help="drop interactions with more prompt tokens")
+    parser.add_argument("--min-prefill", type=int, default=256, help="new prompt tokens required before a turn counts toward prefill tok/s")
+    parser.add_argument("--json", action="store_true", help="print the measurement as JSON")
+    parser.add_argument("--database", type=Path, help="interaction database (default: state/qwasar.db)")
     arguments = parser.parse_args()
     if arguments.command == "wait-ready":
         if arguments.pid is None or arguments.pid <= 0:
             parser.error("wait-ready requires a positive --pid")
         wait_ready({"pid": arguments.pid, "start": process_start(arguments.pid)})
+        return
+    if arguments.command == "stats":
+        stats(arguments)
         return
     managed = systemd_command(arguments.command, arguments.prefill)
     if managed is not None:

@@ -962,6 +962,7 @@ Qwarz is running.
 
   Manage:   qwarz status
   Logs:     qwarz logs
+  Stats:    qwarz stats
   Stop:     qwarz stop
   Why:      qwarz explain"#,
         resolved.gpu.name,

@@ -2,7 +2,7 @@ mod setup;
 
 use setup::Options;
 
-const DELEGATED: [&str; 5] = ["serve", "stop", "status", "logs", "wait-ready"];
+const DELEGATED: [&str; 6] = ["serve", "stop", "status", "logs", "stats", "wait-ready"];
 
 fn usage() {
     println!(
@@ -20,6 +20,15 @@ commands:
   status              service status
   logs                follow the service logs
   stop                stop the service
+  stats               tok/s, TTFT, prefill and acceptance over the newest
+                      stored interactions
+                      --last N (default 20)
+                      --since 30m|2h|1d
+                      --status completed,incomplete|all
+                      --min-completion N (default 1, decode sample)
+                      --min-prompt N  --max-prompt N
+                      --min-prefill N (default 256, prefill sample)
+                      --json  --database PATH
   serve, wait-ready   internal commands used by the systemd unit
 
 start options:
