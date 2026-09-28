@@ -129,8 +129,7 @@ def rope():
     return RoPE("cuda", settings)
 
 
-def empty_cache():
-    pages = 1
+def empty_cache(pages=1):
     packed = (pages, PAGE, KV_HEADS, HEAD_DIM // 2)
     scales = (pages, PAGE, KV_HEADS, HEAD_DIM // 16)
     return (
@@ -141,12 +140,16 @@ def empty_cache():
     )
 
 
-def attend(q, k, v, cache):
+def attend(q, k, v, cache, cache_len=0):
     _runtime()
+    from qwasar_runtime.hybrid import prepare_environment
     from qwasar_runtime.xqa import NVFP4AttentionAdapter
 
+    prepare_environment()
+    import flashinfer
     k_cache, v_cache, k_scales, v_scales = cache
     seqlen = q.shape[1]
+    pages = k_cache.shape[0]
     args = AttnArgs(
         bsz=1,
         q_len=seqlen,
@@ -165,17 +168,20 @@ def attend(q, k, v, cache):
         max_seqlen=None,
         window_size=None,
         softcap=0.0,
-        block_table=torch.zeros((1, 1), dtype=torch.int32, device=q.device),
-        cache_seqlens=torch.zeros((1,), dtype=torch.int32, device=q.device),
+        block_table=torch.arange(pages, dtype=torch.int32, device=q.device).view(1, pages),
+        cache_seqlens=torch.tensor([cache_len], dtype=torch.int32, device=q.device),
         k_scales=k_scales,
         v_scales=v_scales,
     )
-    # 63 tokens take the prefill route: append NVFP4, gather to fp16, SDPA.
-    adapter = NVFP4AttentionAdapter("nvfp4-xqa", None, prefill="sdpa", decode_graphs=False)
-    return adapter._flash_prefill(args, seqlen)
+    # Q>=8192 gathers NVFP4 and attends with PRIMS. Shorter prefills use SDPA.
+    # A single token uses XQA over the same pages.
+    adapter = NVFP4AttentionAdapter("nvfp4-xqa", flashinfer, prefill="prims", decode_graphs=False)
+    return adapter(args)
 
 
-def attention_forward(hidden, weights):
+def attention_forward(hidden, weights, cache=None, cache_len=0):
+    if cache is None:
+        cache = empty_cache()
     q_packed = project(hidden, weights, "q_proj", Q_OUT, HIDDEN, torch.float16)
     seqlen = hidden.shape[1]
     query = torch.empty((1, seqlen, HEADS, HEAD_DIM), dtype=torch.float16, device=hidden.device)
@@ -183,12 +189,15 @@ def attention_forward(hidden, weights):
     ext.deinterleave_qg(q_packed, query, gate, HEAD_DIM)
     key = project(hidden, weights, "k_proj", KV_OUT, HIDDEN, torch.float16).view(1, seqlen, KV_HEADS, HEAD_DIM)
     value = project(hidden, weights, "v_proj", KV_OUT, HIDDEN, torch.float16).view(1, seqlen, KV_HEADS, HEAD_DIM)
+    # A later chunk starts at cache_len. The first chunk keeps the zero origin.
+    positions = None
+    if cache_len > 0:
+        positions = torch.tensor([cache_len], dtype=torch.int32, device=hidden.device)
     query, key = rope().apply(
-        query, key, 0, None, None, True,
+        query, key, 0, positions, None, True,
         weights["q_norm.weight"], weights["k_norm.weight"], RMS_EPS, 1.0, None, False,
     )
-    cache = empty_cache()
-    mixed = attend(query, key, value, cache)
+    mixed = attend(query, key, value, cache, cache_len)
     flat = mixed.reshape(1, seqlen, HEADS * HEAD_DIM)
     ext.mul_sigmoid_(flat, gate)
     output = project(flat, weights, "o_proj", HIDDEN, HEADS * HEAD_DIM, torch.float32)

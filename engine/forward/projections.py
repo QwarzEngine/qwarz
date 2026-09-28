@@ -26,7 +26,7 @@ from engine.forward.embed import (
     prefill_ids,
     tensor_sha256,
 )
-from engine.forward.gdn import HEAD_DIM, NUM_K_HEADS, NUM_V_HEADS, _load
+from engine.forward.gdn import HEAD_DIM, NUM_K_HEADS, NUM_V_HEADS
 
 ORACLE_GDN_OUTPUT = "b8b0b6b5b029cca6712a63c5562a68c4cf4f66b74773d746cb2cdee6687114fb"
 ORACLE_QKV = "d133a96464876c675d909cc81815cb4d4076a483ee552ea4ede5fd5d09309b8e"
@@ -98,19 +98,38 @@ def project(hidden, weights):
     return qkv_out, z, b, a
 
 
-def gdn_forward(hidden, weights):
+def _capture_chunk(mixed_qkv, beta, g, recurrent):
+    """Prefill writes the final chunk state without feeding a zero initial state."""
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    bsz, seqlen, _ = mixed_qkv.shape
+    k_dim = NUM_K_HEADS * HEAD_DIM
+    v_dim = NUM_V_HEADS * HEAD_DIM
+    query, key, value = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim=-1)
+    core, new_state = chunk_gated_delta_rule(
+        query.view(bsz, seqlen, NUM_K_HEADS, HEAD_DIM),
+        key.view(bsz, seqlen, NUM_K_HEADS, HEAD_DIM),
+        value.view(bsz, seqlen, NUM_V_HEADS, HEAD_DIM),
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    recurrent[0, 0].copy_(new_state[0])
+    return core
+
+
+def gdn_forward(hidden, weights, state=None):
     from exllamav3.modules.gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 
-    library = _load()
     qkv, z, b, a = project(hidden, weights)
     seqlen = hidden.shape[1]
     beta = torch.empty(1, seqlen, NUM_V_HEADS, device="cuda", dtype=torch.bfloat16)
     g = torch.empty(1, seqlen, NUM_V_HEADS, device="cuda", dtype=torch.float32)
-    a_log = weights["A_log"].float().contiguous()
-    library.q38_gdn_fused_op_2(
-        b.data_ptr(), a.data_ptr(), weights["dt_bias"].data_ptr(), a_log.data_ptr(),
-        beta.data_ptr(), g.data_ptr(), 1, seqlen, NUM_V_HEADS, 1.0,
-    )
+    # The ported sigmoid rounds b=-3.7929 to a different bf16 than ExLlama, and
+    # that one value moves the layer-2 state. This is the kernel the oracle runs.
+    ext.gated_delta_net_fused_op_2(b, a, weights["dt_bias"], weights["A_log"], beta, g, 1.0)
     mixed = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
     conv = weights["conv1d.weight"]
     if conv.dim() == 3:
@@ -118,18 +137,31 @@ def gdn_forward(hidden, weights):
     # Prefill longer than 32 tokens uses ExLlama's Triton conv. At 63 tokens
     # the delta rule is the chunk kernel, because the length reaches the 48
     # value heads. The ported recurrent kernel remains the short decode path.
-    conv_out = causal_conv1d_update(mixed, None, None, conv, weights.get("conv1d.bias"), False, {})
-    core = gated_delta_rule_fn(
-        conv_out, beta, g, None, None, False, False,
-        NUM_K_HEADS, NUM_V_HEADS, NUM_K_HEADS * HEAD_DIM, NUM_V_HEADS * HEAD_DIM,
-        HEAD_DIM, HEAD_DIM, {},
+    slots = None if state is None else torch.arange(hidden.shape[0], device=hidden.device, dtype=torch.int32)
+    conv_out = causal_conv1d_update(
+        mixed, None if state is None else state.conv, slots, conv, weights.get("conv1d.bias"), False, {},
     )
+    if state is None:
+        core = gated_delta_rule_fn(
+            conv_out, beta, g, None, None, False, False,
+            NUM_K_HEADS, NUM_V_HEADS, NUM_K_HEADS * HEAD_DIM, NUM_V_HEADS * HEAD_DIM,
+            HEAD_DIM, HEAD_DIM, {},
+        )
+    elif seqlen >= NUM_V_HEADS and not state.ready:
+        core = _capture_chunk(conv_out, beta, g, state.recurrent)
+        state.ready = True
+    else:
+        core = gated_delta_rule_fn(
+            conv_out, beta, g, state.recurrent, slots, False, True,
+            NUM_K_HEADS, NUM_V_HEADS, NUM_K_HEADS * HEAD_DIM, NUM_V_HEADS * HEAD_DIM,
+            HEAD_DIM, HEAD_DIM, {},
+        )
     y = torch.empty_like(core, dtype=torch.float16)
     ext.gated_rms_norm(core, weights["norm.weight"], y, z, 1e-6, 0.0, 1, False)
     flat = y.view(1, seqlen, Z_OUT)
     out_layer = exl3(
         "out", weights["out_proj.trellis"], weights["out_proj.suh"], weights["out_proj.svh"],
-        weights["out_proj.mul1"], 5120,
+        weights["out_proj.mul1"], 5120, Z_OUT,
     )
     return out_layer.forward(flat, {}), qkv, z, a, b
 
