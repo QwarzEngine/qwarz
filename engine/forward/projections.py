@@ -28,7 +28,6 @@ from engine.forward.embed import (
 )
 from engine.forward.gdn import HEAD_DIM, NUM_K_HEADS, NUM_V_HEADS, _load
 
-PREFIX = "model.language_model.layers.0.linear_attn"
 ORACLE_GDN_OUTPUT = "b8b0b6b5b029cca6712a63c5562a68c4cf4f66b74773d746cb2cdee6687114fb"
 ORACLE_QKV = "d133a96464876c675d909cc81815cb4d4076a483ee552ea4ede5fd5d09309b8e"
 ORACLE_Z = "20e85a7103286b8d349498f080ea64df4a8ac672dd1a4856b34ca797bdec14ab"
@@ -57,24 +56,25 @@ def hidden_state(model):
     return hidden
 
 
-def exl3(name, trellis, suh, svh, mul1, out_features):
+def exl3(name, trellis, suh, svh, mul1, out_features, in_features=5120, out_dtype=torch.float):
     return LinearEXL3(
         config=NullConfig(),
-        in_features=5120,
+        in_features=in_features,
         out_features=out_features,
         suh=suh,
         svh=svh,
         trellis=trellis,
         mul1=mul1,
-        out_dtype=torch.float,
+        out_dtype=out_dtype,
         key=name,
     )
 
 
-def load_layer(model):
+def load_layer(model, index=0):
+    prefix = f"model.language_model.layers.{index}.linear_attn"
     with safe_open(model / "model-00001-of-00003.safetensors", framework="pt", device="cpu") as handle:
-        names = [key for key in handle.keys() if key.startswith(PREFIX)]
-        got = {name[len(PREFIX) + 1:]: handle.get_tensor(name).cuda().contiguous() for name in names}
+        names = [key for key in handle.keys() if key.startswith(prefix)]
+        got = {name[len(prefix) + 1:]: handle.get_tensor(name).cuda().contiguous() for name in names}
     return got
 
 
@@ -98,7 +98,7 @@ def project(hidden, weights):
     return qkv_out, z, b, a
 
 
-def layer_output(hidden, weights):
+def gdn_forward(hidden, weights):
     from exllamav3.modules.gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 
     library = _load()
@@ -131,7 +131,11 @@ def layer_output(hidden, weights):
         "out", weights["out_proj.trellis"], weights["out_proj.suh"], weights["out_proj.svh"],
         weights["out_proj.mul1"], 5120,
     )
-    out = out_layer.forward(flat, {})
+    return out_layer.forward(flat, {}), qkv, z, a, b
+
+
+def layer_output(hidden, weights):
+    out, qkv, z, a, b = gdn_forward(hidden, weights)
     qkv_sha = sha256(qkv)
     z_sha = sha256(z)
     a_sha = sha256(a)
