@@ -227,3 +227,59 @@ async fn disconnected_nonstreaming_prefill_cancels_without_waiting_for_a_delta()
     assert_ne!(worker.pid.load(Ordering::Acquire), original_pid);
     worker.shutdown().await;
 }
+
+#[tokio::test]
+async fn split_deltas_are_separate_chunks_and_are_not_sent_again() {
+    let worker = spawn_worker("split");
+    ready(&worker).await;
+    let store = Arc::new(Store::open(std::path::Path::new(":memory:")).unwrap());
+    let app = service::router(App {
+        worker: worker.clone(),
+        store,
+    });
+    let response = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":api::MODEL,"messages":[{"role":"user","content":"hello"}],"stream":true})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    idle(&worker).await;
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let wire = String::from_utf8(bytes.to_vec()).unwrap();
+    let mut contents = Vec::new();
+    let mut saw_role = false;
+    let mut saw_finish = false;
+    for line in wire.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        if line == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line).unwrap();
+        let choice = &event["choices"][0];
+        let delta = &choice["delta"];
+        if delta["role"] == "assistant" {
+            assert!(delta.get("content").is_none());
+            assert!(contents.is_empty());
+            saw_role = true;
+        }
+        if let Some(text) = delta["content"].as_str() {
+            assert!(!saw_finish);
+            contents.push(text.to_string());
+        }
+        if choice["finish_reason"] == "stop" {
+            saw_finish = true;
+            assert_eq!(contents, vec!["ab".to_string(), "cd".to_string()]);
+        }
+    }
+    worker.shutdown().await;
+    assert!(saw_role);
+    assert!(saw_finish);
+    assert_eq!(contents.concat(), "abcd");
+    assert!(!wire.contains("\"content\":\"abcd\""));
+}

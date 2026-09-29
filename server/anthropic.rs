@@ -40,7 +40,7 @@ pub fn http_error(status: u16, code: &str, message: &str) -> Response {
         | "ambiguous_history"
         | "unknown_image"
         | "invalid_idempotency_key" => "invalid_request_error",
-        "worker_unavailable" | "busy" => "overloaded_error",
+        "worker_unavailable" | "busy" | "runtime_busy" => "overloaded_error",
         _ => "api_error",
     };
     (

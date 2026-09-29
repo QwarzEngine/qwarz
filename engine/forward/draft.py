@@ -16,7 +16,7 @@ from engine.forward.embed import gather
 from engine.forward.mlp import HIDDEN
 from engine.forward.mtp import DRAFT_TOKENS
 from engine.forward.projections import exl3
-from engine.forward.token import rms
+from engine.forward.token import _output_head, rms
 
 INTERMEDIATE = 17408
 
@@ -111,11 +111,9 @@ class MTPDraft:
 
     def step(self, token_id, hidden):
         state = self._block(self._fuse(torch.tensor([[token_id]], dtype=torch.long), hidden))
-        head = self.catalog.group("lm_head")
-        layer = exl3(
-            "lm_head", head["trellis"], head["suh"], head["svh"], head["mul1"],
-            248320, HIDDEN, torch.float16,
-        )
+        # The proposer scores with the shared lm_head. Reloading that trellis
+        # on every draft token copies about 910 MiB from the checkpoint.
+        _weight, layer = _output_head(self.catalog)
         nxt = int(layer.forward(state, {}).reshape(-1).argmax())
         return nxt, state
 

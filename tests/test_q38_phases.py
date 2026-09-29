@@ -101,6 +101,7 @@ def test_a_second_generate_is_rejected_while_one_is_open():
     assert rejected[0]["error"]["http_status"] == 409
     assert session.cursor == 8
     assert worker.active == "resp_open"
+    print("OBSERVATION overlapping generate is runtime_busy HTTP 409 and the cursor stays on the open turn")
 
 
 def test_branch_before_the_commit_restarts_from_zero():
@@ -327,6 +328,7 @@ def test_a_short_accept_keeps_the_cursor_on_the_returned_tokens():
     follow = worker.push('{"op":"generate","id":"resp_suffix","request":{"ids":[1,2,3,4,5,6]}}')
     assert follow[0]["status"] == "completed"
     assert follow[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+    print("OBSERVATION max_new=1 full accept leaves the cursor at 4 on the prompt and the later prefix continues with cached_tokens 4")
 
     fresh = _scripted_session(samples)
     Worker(fresh).push('{"op":"generate","id":"resp_hold","request":{"ids":[1,2,3,4],"max_new":1}}')
@@ -355,6 +357,586 @@ def test_a_diverged_draft_does_not_stick_the_worker():
     done = worker.push('{"op":"generate","id":"resp_next","request":{"ids":[1,2,3,4]}}')
     assert done[0]["status"] == "completed"
     assert done[0]["token_ids"] == [42]
+    assert worker.active is None
+
+
+def test_a_stop_token_ends_the_window_before_the_rest_is_repaired():
+    from engine.forward.cycle import continue_drafted
+
+    session = _scripted_session([10, 11, 12, 13, 14, 15, 77])
+    tokens, cycle = continue_drafted(
+        session.runner, [1, 2, 3, 4], 7, cycle=session.cycle, stop_ids={12},
+    )
+    assert tokens == [10, 11, 12]
+    assert cycle.cache_len == 6
+    assert cycle.draft.position == 6
+
+
+def test_chat_without_ids_returns_text_and_keeps_the_prefix():
+    import json
+
+    from qwasar_runtime.engine import FakeTokenizer
+
+    class _Talk(FakeTokenizer):
+        def decode_ids(self, ids):
+            return "".join(chr(token) for token in ids if token < 128)
+
+    end = _Talk.special["<|im_end|>"]
+    close = [_Talk.special["</think>"], ord("\n"), ord("\n")]
+    session = _scripted_session([end, 0, 0, 0, 0, 0, 0])
+    worker = Worker(session, _Talk())
+    done = worker.push(json.dumps({
+        "op": "generate", "id": "resp_chat",
+        "request": {"messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": 8},
+    }))
+    assert done[0]["type"] == "started"
+    assert done[-1]["type"] == "terminal"
+    assert any(event["type"] == "delta" for event in done)
+    assert done[-1]["status"] == "completed"
+    assert done[-1]["message"]["content"] == "\n\n"
+    assert done[-1]["message"]["reasoning_content"] == ""
+    assert done[-1]["token_ids"] == close + [end]
+    assert done[-1]["snapshot"]["version"] == 1
+    assert "xhigh" in done[-1]["snapshot"]["header"]
+    assert session.cursor == len(done[-1]["snapshot"]["tape"])
+    cursor = session.cursor
+    follow_messages = done[-1]["snapshot"]["messages"] + [{"role": "user", "content": "next"}]
+    follow = worker.push(json.dumps({
+        "op": "generate", "id": "resp_next", "parent": done[-1]["snapshot"],
+        "request": {"messages": follow_messages, "thinking": "off", "max_tokens": 1},
+    }))
+    assert follow[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == cursor
+
+
+def test_a_decoded_tool_call_is_returned_as_a_function_call():
+    import json
+
+    from engine.forward.chat import finish_turn
+    from qwasar_runtime.engine import FakeTokenizer
+
+    class _Talk(FakeTokenizer):
+        def decode_ids(self, ids):
+            return "".join(chr(token) for token in ids if token < 128)
+
+    xml = (
+        "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    end = _Talk.special["<|im_end|>"]
+    prepared = {
+        "stop": end,
+        "thinking": "off",
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}],
+        "tool_choice": "auto",
+    }
+    turn = finish_turn(_Talk(), prepared, [ord(character) for character in xml] + [end], "resp_tool")
+    assert turn["status"] == "completed"
+    assert turn["message"]["content"] == ""
+    assert turn["message"]["tool_calls"][0]["function"]["name"] == "read"
+    assert json.loads(turn["message"]["tool_calls"][0]["function"]["arguments"]) == {"path": "a.txt"}
+    assert turn["deltas"] == []
+
+
+def test_chat_text_is_a_delta_and_raw_ids_stay_a_single_terminal():
+    from qwasar_runtime.engine import FakeTokenizer
+
+    class _Talk(FakeTokenizer):
+        def decode_ids(self, ids):
+            return "".join(chr(token) for token in ids if token < 128)
+
+    session = _scripted_session([80, 0, 0, 0, 0, 0, 0])
+    worker = Worker(session, _Talk())
+    done = worker.push(
+        '{"op":"generate","id":"resp_pong","request":{"messages":[{"role":"user","content":"hi"}],'
+        '"thinking":"off","max_tokens":1}}'
+    )
+    assert done[0]["type"] == "started"
+    assert done[1] == {"type": "delta", "id": "resp_pong", "channel": "reasoning", "text": "P"}
+    assert done[-1]["message"]["reasoning_content"] == "P"
+    assert done[-1]["message"]["content"] == "\n\n"
+    assert done[-1]["status"] == "incomplete"
+    assert done[-1]["metrics"]["incomplete_reason"] == "reasoning_budget"
+    assert done[-1]["metrics"]["finish_reason"] == "max_new_tokens"
+    assert done[-1]["snapshot"] is None
+    raw = Worker(_scripted_session([42, 0, 0, 0, 0, 0, 0])).push(
+        '{"op":"generate","id":"resp_raw","request":{"ids":[1,2,3,4]}}'
+    )
+    assert len(raw) == 1
+    assert raw[0]["type"] == "terminal"
+    assert raw[0]["token_ids"] == [42]
+    assert raw[0]["message"]["content"] == ""
+    assert raw[0]["message"]["reasoning_content"] == ""
+    sha = "ab" * 32
+    refused = worker.push(
+        '{"op":"generate","id":"resp_img","request":{"messages":[{"role":"user","content":[{"type":"image","sha256":"'
+        + sha + '","media_type":"image/png"}]}]}}'
+    )
+    assert refused[0]["error"]["message"] == f"image {sha} has no inline data"
+    assert worker.active is None
+
+
+def _bind(runner):
+    from engine.forward.cycle import DraftCycle
+
+    session = Session(runner)
+    session.cycle = DraftCycle(runner, draft=runner.draft)
+    return session
+
+
+def _talk():
+    from qwasar_runtime.engine import FakeTokenizer
+
+    class _Mapped(FakeTokenizer):
+        def decode_ids(self, ids):
+            names = {value: key for key, value in self.special.items()}
+            parts = []
+            for token in ids:
+                if token in names:
+                    parts.append(names[token])
+                elif 0 <= token < 128:
+                    parts.append(chr(token))
+            return "".join(parts)
+
+    return _Mapped()
+
+
+def _chat(worker, response_id, request, parent=None, emit=None):
+    import json
+
+    payload = {"op": "generate", "id": response_id, "request": request}
+    if parent is not None:
+        payload["parent"] = parent
+    return worker.push(json.dumps(payload), emit=emit)
+
+
+def test_messages_stay_high_when_the_client_disables_thinking():
+    import pytest
+
+    from engine.forward.chat import prepare_chat
+    from qwasar_runtime.engine import reasoning_token_cap
+
+    assert reasoning_token_cap("xhigh", 32768) == 8192
+    talk = _talk()
+    think = talk.special["<think>"]
+    close = talk.special["</think>"]
+    base = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32768}
+    for thinking in (None, "off", "low", "medium", "xhigh"):
+        request = dict(base)
+        if thinking is not None:
+            request["thinking"] = thinking
+        prepared = prepare_chat(talk, request, None, 262144)
+        assert prepared["thinking"] == "xhigh"
+        assert prepared["reasoning_cap"] == 8192
+        assert "xhigh" in prepared["header"]
+        assert prepared["tokens"][-2] == think
+        assert prepared["tokens"][-1] == ord("\n")
+        assert close not in prepared["tokens"]
+    zero = prepare_chat(talk, {**base, "thinking": "off", "reasoning_budget_tokens": 0}, None, 262144)
+    assert zero["thinking"] == "xhigh"
+    assert zero["reasoning_cap"] == 0
+    assert close not in zero["tokens"]
+    assert prepare_chat(talk, {**base, "max_tokens": 10, "reasoning_budget_tokens": 2}, None, 262144)["reasoning_cap"] == 2
+    with pytest.raises(ValueError):
+        prepare_chat(talk, {**base, "thinking": "banana"}, None, 262144)
+    with pytest.raises(ValueError):
+        prepare_chat(talk, {**base, "temperature": True}, None, 262144)
+    session = _scripted_session([ord("A"), 0, 0, 0, 0, 0, 0])
+    done = _chat(Worker(session, talk), "resp_high", {
+        "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, "temperature": 0,
+    })
+    assert done[1]["channel"] == "reasoning"
+    assert done[1]["text"] == "A"
+    assert done[-1]["token_ids"][0] == ord("A")
+    assert done[-1]["message"]["reasoning_content"].startswith("A")
+
+
+def test_chat_deltas_are_emitted_before_the_next_token():
+    import time
+
+    class _Live(_ScriptedRunner):
+        def __init__(self, live):
+            super().__init__([ord("A"), 0, 0, 0, 0, 0, 0])
+            self.live = live
+            self.windows = 0
+
+        def score_window(self):
+            self.windows += 1
+            if self.windows >= 2:
+                assert any(event.get("type") == "delta" for event in self.live)
+                time.sleep(0.002)
+            return [ord("A"), 0, 0, 0, 0, 0, 0]
+
+    live = []
+    runner = _Live(live)
+    done = _chat(Worker(_bind(runner), _talk()), "resp_stream", {
+        "messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": 8,
+    }, emit=live.append)
+    assert [event["type"] for event in done] == ["terminal"]
+    assert live[0]["type"] == "started"
+    deltas = [event for event in live if event["type"] == "delta"]
+    assert len(deltas) > 1
+    assert deltas[0]["channel"] == "reasoning"
+    terminal = done[0]
+    for channel, field in (("reasoning", "reasoning_content"), ("content", "content")):
+        joined = "".join(event["text"] for event in deltas if event["channel"] == channel)
+        assert joined == terminal["message"][field]
+        assert "<|im_end|>" not in joined
+    metrics = terminal["metrics"]
+    assert isinstance(metrics["ttft_ms"], float)
+    assert isinstance(metrics["decode_tokens_per_second"], float)
+    assert metrics["reasoning_tokens"] == 4
+    assert metrics["finish_reason"] == "max_new_tokens"
+    assert metrics["draft_acceptance"] == 0.0
+    assert metrics["reasoning_closed"] == "budget"
+    assert terminal["message"]["reasoning_content"] == "AAAA"
+    assert terminal["message"]["content"] == "\n\nA"
+
+
+def test_a_split_character_does_not_replay_reasoning_into_the_answer():
+    talk = _talk()
+    end = talk.special["<|im_end|>"]
+    close = talk.special["</think>"]
+
+    class _Wave(type(talk)):
+        def decode_ids(self, ids):
+            names = {value: key for key, value in self.special.items()}
+            parts = []
+            index = 0
+            while index < len(ids):
+                token = ids[index]
+                if token == 1 and index + 1 < len(ids) and ids[index + 1] == 2:
+                    parts.append("👋")
+                    index += 2
+                    continue
+                if token == 1:
+                    parts.append("\ufffd")
+                elif token in names:
+                    parts.append(names[token])
+                elif 0 <= token < 128:
+                    parts.append(chr(token))
+                index += 1
+            return "".join(parts)
+
+    samples = [ord(character) for character in "Think"]
+    samples += [close, ord("H"), ord("i"), 1, 2, ord("!"), end]
+
+    class _Queue(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([0, 0, 0, 0, 0, 0, 0])
+            self.queue = list(samples)
+
+        def score_window(self):
+            first = self.queue.pop(0) if self.queue else end
+            return [first, 0, 0, 0, 0, 0, 0]
+
+    done = _chat(Worker(_bind(_Queue()), _Wave()), "resp_wave", {
+        "messages": [{"role": "user", "content": "hi"}], "max_tokens": 32,
+    })
+    message = done[-1]["message"]
+    assert message["reasoning_content"] == "Think"
+    assert message["content"] == "Hi👋!"
+    assert "</think>" not in message["content"]
+    assert "\ufffd" not in message["content"]
+    assert message["content"].count("Think") == 0
+    deltas = [event for event in done if event["type"] == "delta"]
+    for channel, field in (("reasoning", "reasoning_content"), ("content", "content")):
+        assert "".join(event["text"] for event in deltas if event["channel"] == channel) == message[field]
+
+
+def test_an_image_is_spliced_and_bad_images_are_rejected():
+    import base64
+    import hashlib
+    import struct
+
+    from engine.forward.vision import text_table_ids
+    from qwasar_runtime.vision import MAX_IMAGE_BYTES
+
+    assert text_table_ids([1, MM_TOKEN_BASE + 4, 2]) == [1, 0, 2]
+    talk = _talk()
+    end = talk.special["<|im_end|>"]
+    think_end = talk.special["</think>"]
+    raw = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", 32, 32)
+    sha = hashlib.sha256(raw).hexdigest()
+    image = {"media_type": "image/png", "data": base64.b64encode(raw).decode()}
+    message = {"role": "user", "content": [
+        {"type": "text", "text": "see"},
+        {"type": "image", "sha256": sha, "media_type": "image/png"},
+    ]}
+
+    class _Vision(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([0, 0, 0, 0, 0, 0, 0])
+            self.queue = [think_end, ord("o"), ord("k"), end, end, end, end]
+            self.seen = []
+
+        def forward(self, token_ids, cache_len, embedded=None, inv_freq=None):
+            self.seen.append((list(token_ids), embedded, inv_freq))
+            super().forward(token_ids, cache_len, embedded, inv_freq)
+
+        def score_window(self):
+            first = self.queue.pop(0) if self.queue else end
+            return [first, 0, 0, 0, 0, 0, 0]
+
+    runner = _Vision()
+    session = _bind(runner)
+    worker = Worker(session, talk)
+    done = _chat(worker, "resp_image", {"messages": [message], "images": {sha: image}, "max_tokens": 16})
+    assert done[-1]["status"] == "completed"
+    assert done[-1]["error"] is None
+    assert done[-1]["message"]["content"] == "ok"
+    assert "not available" not in str(done[-1])
+    found = False
+    for ids, embedded, inv in runner.seen:
+        assert inv == "mrope"
+        if not embedded:
+            continue
+        vision = [token for kind, token in embedded if kind == "vision"]
+        text = [token for kind, token in embedded if kind == "text"]
+        if not vision:
+            continue
+        found = True
+        assert all(token >= MM_TOKEN_BASE for token in vision)
+        assert all(token in ids for token in vision)
+        assert all(token < MM_TOKEN_BASE for token in text)
+    assert found
+    plain = _chat(Worker(_scripted_session([end, 0, 0, 0, 0, 0, 0]), talk), "resp_plain", {
+        "messages": [{"role": "user", "content": "see"}], "max_tokens": 8,
+    })
+    assert done[-1]["usage"]["prompt_tokens"] > plain[-1]["usage"]["prompt_tokens"]
+    tape = done[-1]["snapshot"]["tape"]
+    assert -1 in tape
+    assert any(token >= MM_TOKEN_BASE for token in session.tape)
+    assert canonical_tape(session.tape) == tape
+    cursor = session.cursor
+    follow_messages = done[-1]["snapshot"]["messages"] + [{"role": "user", "content": "next"}]
+    follow = _chat(worker, "resp_follow", {
+        "messages": follow_messages, "images": {sha: image}, "max_tokens": 8,
+    }, parent=done[-1]["snapshot"])
+    assert follow[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == cursor
+
+    def rejected(request):
+        failed = _chat(Worker(_scripted_session([end, 0, 0, 0, 0, 0, 0]), talk), "resp_bad", request)
+        assert failed[0]["status"] == "failed"
+        assert failed[0]["type"] == "terminal"
+        return failed[0]["error"]["message"]
+
+    bad_sha = "cd" * 32
+    assert rejected({"messages": [{"role": "user", "content": [
+        {"type": "image", "sha256": bad_sha, "media_type": "image/bmp"}]}]}) == "unsupported image media type"
+    assert rejected({"messages": [message], "images": {sha: {"media_type": "image/png", "data": "@@@"}}}) == (
+        "image data is not valid base64"
+    )
+    assert rejected({"messages": [{"role": "user", "content": [
+        {"type": "image", "sha256": bad_sha, "media_type": "image/png"}]}],
+        "images": {bad_sha: image}}) == f"image data does not match sha256 {bad_sha}"
+    huge = "aa" * 32
+    assert rejected({"messages": [{"role": "user", "content": [
+        {"type": "image", "sha256": huge, "media_type": "image/png"}]}],
+        "images": {huge: {"media_type": "image/png", "data": base64.b64encode(b"\x00" * (MAX_IMAGE_BYTES + 1)).decode()}},
+    }) == f"image must contain 1..{MAX_IMAGE_BYTES} bytes"
+    many = [f"{index:064x}" for index in range(17)]
+    assert rejected({"messages": [{"role": "user", "content": [
+        {"type": "image", "sha256": item, "media_type": "image/png"} for item in many]}]}) == (
+        "at most 16 images per request"
+    )
+    assert rejected({"messages": [message]}) == f"image {sha} has no inline data"
+
+
+def test_sampling_repeats_for_a_seed_and_can_diverge():
+    class _Logits(_ScriptedRunner):
+        def __init__(self, row):
+            super().__init__([0, 0, 0, 0, 0, 0, 0])
+            self.row = row
+
+        def score_logits(self):
+            return [list(self.row) for _ in range(7)]
+
+    def row(left, right):
+        values = [-1e9] * 82
+        values[80] = left
+        values[81] = right
+        return values
+
+    talk = _talk()
+
+    def first_token(values, seed, temperature, top_p=1.0):
+        done = _chat(Worker(_bind(_Logits(values)), talk), "resp_sample", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1, "temperature": temperature, "top_p": top_p, "seed": seed,
+        })
+        return done[-1]["token_ids"][0]
+
+    peak = row(1.0, 0.0)
+    assert first_token(peak, 1, 0) == 80
+    assert first_token(peak, 2, 0) == 80
+    flat = row(0.0, 0.0)
+    assert first_token(flat, 7, 1) == first_token(flat, 7, 1)
+    drawn = {first_token(flat, seed, 1) for seed in range(1, 25)}
+    assert drawn <= {80, 81}
+    assert len(drawn) >= 2
+    assert {first_token(peak, seed, 1, top_p=0.5) for seed in range(1, 9)} == {80}
+
+
+def test_tensor_sampling_matches_the_list_draw():
+    import pytest
+    torch = pytest.importorskip("torch")
+    from engine.forward.sample import sample_id
+    import random
+
+    peak = [-1e9] * 82
+    peak[80] = 1.0
+    peak[81] = 0.0
+    flat = [-1e9] * 82
+    flat[80] = 0.0
+    flat[81] = 0.0
+    for values, temperature, top_p, seed in (
+        (peak, 0, 1.0, 1),
+        (peak, 1, 0.5, 3),
+        (flat, 1, 1.0, 7),
+        (flat, 1, 1.0, 8),
+    ):
+        listed = sample_id(values, temperature, top_p, random.Random(seed))
+        tensor = sample_id(torch.tensor(values), temperature, top_p, random.Random(seed))
+        assert tensor == listed
+
+
+def test_a_tool_call_survives_the_resident_chat_turn():
+    import json
+
+    talk = _talk()
+    end = talk.special["<|im_end|>"]
+    xml = (
+        "<tool_call>\n<function=read>\n<parameter=path>\na.txt\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    samples = [talk.special["</think>"]] + [ord(character) for character in xml] + [end]
+
+    class _Queue(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([0, 0, 0, 0, 0, 0, 0])
+            self.queue = list(samples)
+
+        def score_window(self):
+            return [self.queue.pop(0), 0, 0, 0, 0, 0, 0]
+
+    done = _chat(Worker(_bind(_Queue()), talk), "resp_tool", {
+        "messages": [{"role": "user", "content": "read it"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}],
+        "max_tokens": 128,
+    })
+    assert done[-1]["status"] == "completed"
+    call = done[-1]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "read"
+    assert json.loads(call["arguments"]) == {"path": "a.txt"}
+    assert "<|im_end|>" not in done[-1]["message"]["content"]
+
+
+def test_the_high_cap_closes_reasoning_and_the_answer_continues():
+    talk = _talk()
+    close = [talk.special["</think>"], ord("\n"), ord("\n")]
+
+    def turn(max_tokens, **extra):
+        done = _chat(Worker(_scripted_session([ord("Z"), 0, 0, 0, 0, 0, 0]), talk), "resp_cap", {
+            "messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": max_tokens, **extra,
+        })
+        return done[-1]
+
+    continued = turn(10)
+    assert continued["status"] == "incomplete"
+    assert continued["message"]["reasoning_content"] == "ZZZZZ"
+    assert continued["message"]["content"] == "\n\nZZ"
+    assert continued["metrics"]["reasoning_tokens"] == 5
+    assert continued["metrics"]["reasoning_closed"] == "budget"
+    assert continued["metrics"]["incomplete_reason"] == "max_new_tokens"
+    assert continued["metrics"]["finish_reason"] == "max_new_tokens"
+    assert continued["snapshot"] is None
+    stopped = turn(6)
+    assert stopped["message"]["reasoning_content"] == "ZZZ"
+    assert stopped["message"]["content"] == "\n\n"
+    assert stopped["token_ids"] == [ord("Z")] * 3 + close
+    assert stopped["metrics"]["incomplete_reason"] == "reasoning_budget"
+    assert stopped["metrics"]["finish_reason"] == "max_new_tokens"
+    assert stopped["metrics"]["draft_acceptance"] == 0.0
+    tight = turn(10, reasoning_budget_tokens=2)
+    assert tight["message"]["reasoning_content"] == "ZZ"
+    assert tight["metrics"]["reasoning_tokens"] == 2
+    assert tight["message"]["content"] == "\n\nZZZZZ"
+    open_cap = turn(4, reasoning_budget_tokens=0)
+    assert open_cap["message"]["reasoning_content"] == "ZZZZ"
+    assert open_cap["message"]["content"] == ""
+    assert open_cap["metrics"]["incomplete_reason"] == "max_new_tokens"
+    assert open_cap["metrics"]["reasoning_closed"] is None
+
+
+def test_cancel_during_a_chat_turn_restores_the_commit():
+    talk = _talk()
+    end = talk.special["<|im_end|>"]
+    samples = [end, end, ord("A"), ord("A"), ord("A"), ord("A"), ord("A")]
+
+    class _Queue(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([0, 0, 0, 0, 0, 0, 0])
+            self.queue = list(samples)
+
+        def score_window(self):
+            first = self.queue.pop(0) if self.queue else end
+            return [first, 0, 0, 0, 0, 0, 0]
+
+    session = _bind(_Queue())
+    worker = Worker(session, talk)
+    first = _chat(worker, "resp_commit", {
+        "messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": 8,
+    })
+    assert first[-1]["status"] == "completed"
+    cursor = session.cursor
+    tape = list(session.tape)
+    follow_messages = first[-1]["snapshot"]["messages"] + [{"role": "user", "content": "next"}]
+    request = {"messages": follow_messages, "thinking": "off", "max_tokens": 8}
+
+    def emit(event):
+        if event.get("type") == "delta":
+            worker.push('{"op":"cancel","id":"resp_cancel"}')
+
+    cancelled = _chat(worker, "resp_cancel", request, parent=first[-1]["snapshot"], emit=emit)
+    assert [event["type"] for event in cancelled] == ["terminal"]
+    assert cancelled[0]["status"] == "cancelled"
+    assert cancelled[0]["snapshot"] is None
+    assert cancelled[0]["message"]["reasoning_content"] == "A"
+    assert cancelled[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == cursor
+    assert session.cursor == cursor
+    assert session.tape == tape
+    assert session.busy is False
+    assert worker.active is None
+    again = _chat(worker, "resp_after", request, parent=first[-1]["snapshot"])
+    assert again[-1]["usage"]["prompt_tokens_details"]["cached_tokens"] == cursor
+
+
+def test_a_second_chat_while_one_is_streaming_is_busy():
+    import json
+
+    talk = _talk()
+    end = talk.special["<|im_end|>"]
+    session = _scripted_session([end, 0, 0, 0, 0, 0, 0])
+    worker = Worker(session, talk)
+    held = {}
+
+    def emit(event):
+        if event["type"] == "started":
+            held["active"] = worker.active
+            held["second"] = worker.push(json.dumps({
+                "op": "generate", "id": "resp_b",
+                "request": {"messages": [{"role": "user", "content": "other"}], "max_tokens": 4},
+            }))
+
+    done = _chat(worker, "resp_a", {
+        "messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": 8,
+    }, emit=emit)
+    assert held["active"] == "resp_a"
+    assert held["second"][0]["error"]["code"] == "runtime_busy"
+    assert held["second"][0]["error"]["http_status"] == 409
+    assert done[-1]["status"] == "completed"
     assert worker.active is None
 
 
@@ -412,6 +994,10 @@ def test_mtp6_window_matches_greedy_on_the_short_prompt():
     )
     assert done[0]["token_ids"] == reference
     assert done[0]["token_ids"][0] == 198
+    print(
+        f"OBSERVATION 64-id generate token_ids={done[0]['token_ids']} "
+        "equal the one-token greedy reference and start with 198"
+    )
     spans = suffix_bounds(0, len(ids))
     assert [(cache, len(span)) for cache, span in runner.calls[: len(spans)]] == [
         (start, end - start) for start, end in spans
@@ -600,6 +1186,7 @@ def test_mtp6_window_matches_greedy_across_prefill_chunks():
     assert spans[-1][1] == len(ids) - 1
     assert all(ids[-1] not in span for _cache, span in runner.calls[: len(spans)])
     assert done[0]["token_ids"] == reference
+    print(f"OBSERVATION 400-id max_new=2 token_ids={done[0]['token_ids']} equal the greedy reference")
     assert session.cycle.accepted + session.cycle.rejected > 0
 
 
@@ -632,6 +1219,8 @@ def test_session_turn_matches_the_vision_forward():
     )
     runner.forward(ids, 0, embedded=rows, inv_freq=freqs)
     token = runner.predict()
+    assert token == 198
+    print("OBSERVATION vision fixture predicts 198")
     runner.reset()
     runner.calls.clear()
     session = Session(runner)
@@ -646,6 +1235,78 @@ def test_session_turn_matches_the_vision_forward():
     assert follow["cached_tokens"] == len(ids)
     assert follow["forwarded"][0][0] == len(ids)
     assert all(item < MM_TOKEN_BASE for _cache, span in runner.calls for item in span)
+
+
+def test_shipped_worker_entry_returns_token_ids():
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root), str(root / "src")])}
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "engine.forward.worker", "--fake", "--model", "unused",
+         "--prefill", "xqa", "--context-size", "1024"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env, cwd=root,
+    )
+    try:
+        command = b""
+        for _ in range(50):
+            if process.poll() is not None:
+                break
+            try:
+                command = Path(f"/proc/{process.pid}/cmdline").read_bytes().replace(b"\0", b" ")
+            except FileNotFoundError:
+                command = b""
+            if b"engine.forward.worker" in command:
+                break
+            time.sleep(0.01)
+        assert b"engine.forward.worker" in command, (command, process.stderr.read())
+        assert b"qwasar_runtime.worker" not in command
+        ready_line = process.stdout.readline()
+        assert ready_line, process.stderr.read()
+        ready = json.loads(ready_line)
+        assert ready["type"] == "ready"
+        assert ready["protocol"] == 1
+        config = ready["config"]
+        assert config["streams"] == 1
+        assert config["vision"] is True
+        assert config["draft_tokens"] == 6
+        assert config["draft_method"] == "mtp"
+        assert config["promotion_allowed"] is False
+        assert config["engine"] == "q38"
+        assert "engine_not_linked" not in ready_line
+        process.stdin.write(json.dumps({
+            "op": "generate", "id": "resp_one", "request": {"ids": [1, 2, 3, 4], "max_new": 1},
+        }) + "\n")
+        process.stdin.flush()
+        done_line = process.stdout.readline()
+        assert done_line, process.stderr.read()
+        done = json.loads(done_line)
+        assert done["status"] == "completed"
+        assert done["token_ids"] == [42]
+        assert done["usage"]["completion_tokens"] == 1
+        assert done["error"] is None
+        assert "engine_not_linked" not in done_line
+        process.stdin.write(json.dumps({
+            "op": "generate", "id": "resp_suffix", "request": {"ids": [1, 2, 3, 4, 5, 6]},
+        }) + "\n")
+        process.stdin.flush()
+        follow = json.loads(process.stdout.readline())
+        assert follow["status"] == "completed"
+        assert follow["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+        print("OBSERVATION shipped worker max_new=1 leaves the cursor on the returned token with cached_tokens 4")
+        process.stdin.write(json.dumps({"op": "shutdown"}) + "\n")
+        process.stdin.flush()
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def test_open_turn_rejects_a_nested_session_turn():

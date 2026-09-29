@@ -273,7 +273,7 @@ fn is_qwarz(pid: i64, cmdline: &str, service_pids: &[i64]) -> bool {
 }
 
 fn short_name(cmdline: &str) -> String {
-    if cmdline.contains("qwasar_runtime.worker") {
+    if cmdline.contains("engine.forward.worker") || cmdline.contains("qwasar_runtime.worker") {
         return "worker".into();
     }
     if cmdline.contains("qwasar-server") {
@@ -589,7 +589,7 @@ mod tests {
         let gpus = parse_gpus("0, GPU-5090, NVIDIA GeForce RTX 5090, 37, 12, 29282, 32607, 44, 29.18, 600.00, 1800, 10001, P8\n1, GPU-3090, NVIDIA GeForce RTX 3090 Ti, 0, 0, 4, 24564, 52, 28.55, 450.00, 210, 405, P8\n").unwrap();
         let apps = parse_apps("GPU-5090, 2099, 28692\nGPU-5090, 34136, 60\n").unwrap();
         let cmdlines = vec![
-            (2099, "/opt/venv/bin/python -m qwasar_runtime.worker --prefill xqa".into()),
+            (2099, "/opt/venv/bin/python -m engine.forward.worker --prefill xqa".into()),
             (34136, "/usr/lib/chromium/chromium --type=gpu-process".into()),
         ];
         let host = Host { cpu_percent: Some(11.5), load: [0.4, 0.5, 0.6], used_bytes: 40.0 * 1024.0_f64.powi(3), total_bytes: 128.0 * 1024.0_f64.powi(3) };

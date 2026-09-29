@@ -237,11 +237,16 @@ async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Resp
     let mut events = match app.worker.start(&id, request, parent).await {
         Ok(receiver) => receiver,
         Err(detail) => {
+            let busy = detail == "busy";
             return fail(
                 wire,
-                if detail == "busy" { 409 } else { 503 },
-                "worker_unavailable",
-                &detail,
+                if busy { 409 } else { 503 },
+                if busy { "runtime_busy" } else { "worker_unavailable" },
+                if busy {
+                    "one generation is already active"
+                } else {
+                    &detail
+                },
             );
         }
     };
@@ -267,6 +272,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Resp
         let mut deadline = Instant::now() + app.worker.request_timeout;
         let mut cancellation_deadline = None;
         let mut forced_failure = None;
+        let mut saw_delta = false;
         let mut terminal;
         loop {
             if forced_failure.is_none() && app.worker.is_cancelled(&id) {
@@ -338,6 +344,7 @@ async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Resp
                 }
             }
             if event["type"] == "delta" && streaming {
+                saw_delta = true;
                 frames = match wire {
                     Wire::Responses => {
                         response_stream.delta(event["channel"] == "reasoning", &event["text"])
@@ -388,7 +395,15 @@ async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Resp
         }
         app.worker.release(&id);
         if let Some(sender) = ready_sender.take() {
-            let _ = sender.send(Err(terminal.clone()));
+            // The resident engine answers with one terminal. A completed
+            // terminal admits the request; the body below carries its token ids.
+            let admitted = matches!(terminal["status"].as_str(), Some("completed" | "incomplete"))
+                && terminal.get("error").is_none_or(Value::is_null);
+            let _ = sender.send(if admitted {
+                Ok(())
+            } else {
+                Err(terminal.clone())
+            });
         }
         if streaming {
             let mut frames = Vec::new();
@@ -416,6 +431,20 @@ async fn generate(app: App, headers: HeaderMap, body: Value, wire: Wire) -> Resp
             } else if matches!(terminal["status"].as_str(), Some("failed" | "cancelled")) {
                 frames.push(sse(&json!({"error":terminal.get("error").filter(|value|!value.is_null()).cloned().unwrap_or(json!({"code":"cancelled","message":"generation cancelled"})),"id":id}),false));
             } else {
+                // A resident turn can finish in one terminal. The text still has
+                // to ride the stream, which is the only body Droid reads.
+                if !saw_delta {
+                    let mut delta = json!({});
+                    if let Some(text) = terminal["message"]["content"].as_str().filter(|text| !text.is_empty()) {
+                        delta["content"] = json!(text);
+                    }
+                    if let Some(text) = terminal["message"]["reasoning_content"].as_str().filter(|text| !text.is_empty()) {
+                        delta["reasoning_content"] = json!(text);
+                    }
+                    if delta.as_object().is_some_and(|fields| !fields.is_empty()) {
+                        frames.push(sse(&api::chat_chunk(&id, delta, Value::Null), false));
+                    }
+                }
                 if let Some(calls) = terminal["message"]["tool_calls"].as_array() {
                     for (index, call) in calls.iter().enumerate() {
                         let mut call = call.clone();

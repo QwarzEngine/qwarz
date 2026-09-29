@@ -704,6 +704,8 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
         "access_programs",
         "generate",
         "response_format",
+        "ids",
+        "max_new",
     ];
     for key in object.keys() {
         if !allowed.contains(&key.as_str()) {
@@ -892,6 +894,9 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
     if !["off", "low", "medium", "xhigh"].contains(&thinking.as_str()) {
         return Err("unsupported reasoning effort".into());
     }
+    // Every messages API shares this prepare. Client efforts, enable_thinking,
+    // and reasoning.enabled stay validated above and do not lower the level.
+    thinking = "xhigh".into();
     let limits: Vec<&Value> = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
         .iter()
         .filter_map(|key| body.get(key))
@@ -908,16 +913,12 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
     if max_tokens == 0 || max_tokens > 32768 {
         return Err("output limit must be 1..32768".into());
     }
-    let temperature = body
-        .get("temperature")
-        .map_or(Ok(if thinking == "off" { 0.7 } else { 1.0 }), |value| {
-            value.as_f64().ok_or("temperature must be numeric")
-        })?;
-    let top_p = body
-        .get("top_p")
-        .map_or(Ok(if thinking == "off" { 0.8 } else { 0.95 }), |value| {
-            value.as_f64().ok_or("top_p must be numeric")
-        })?;
+    let temperature = body.get("temperature").map_or(Ok(1.0), |value| {
+        value.as_f64().ok_or("temperature must be numeric")
+    })?;
+    let top_p = body.get("top_p").map_or(Ok(0.95), |value| {
+        value.as_f64().ok_or("top_p must be numeric")
+    })?;
     if !(0.0..=2.0).contains(&temperature) || top_p <= 0.0 || top_p > 1.0 {
         return Err("invalid sampling range".into());
     }
@@ -966,6 +967,25 @@ pub fn prepare(body: &Value, responses: bool, parent: Option<&Value>) -> Result<
         }
         prepared["reasoning_budget_tokens"] = json!(budget);
     }
+    if let Some(ids) = body.get("ids") {
+        let list = ids.as_array().ok_or("ids must be an array of token ids")?;
+        if list.is_empty() || list.len() > 262_144 {
+            return Err("ids must contain 1..262144 token ids".into());
+        }
+        if list.iter().any(|id| id.as_u64().is_none()) {
+            return Err("ids must be nonnegative integers".into());
+        }
+        prepared["ids"] = ids.clone();
+    }
+    if let Some(max_new) = body.get("max_new") {
+        let value = max_new
+            .as_u64()
+            .ok_or("max_new must be a positive integer")?;
+        if value == 0 || value > 32_768 {
+            return Err("max_new must be 1..32768".into());
+        }
+        prepared["max_new"] = json!(value);
+    }
     Ok(prepared)
 }
 
@@ -998,9 +1018,13 @@ pub fn finish_reason(terminal: &Value) -> &'static str {
 }
 
 pub fn chat_result(id: &str, terminal: &Value) -> Value {
-    json!({"id":id,"object":"chat.completion","created":terminal["created_at"].as_u64().unwrap_or_else(now),"model":MODEL,
+    let mut result = json!({"id":id,"object":"chat.completion","created":terminal["created_at"].as_u64().unwrap_or_else(now),"model":MODEL,
         "choices":[{"index":0,"message":terminal["message"],"finish_reason":finish_reason(terminal)}],
-        "usage":terminal["usage"],"qwasar_metrics":terminal["metrics"],"status":terminal["status"]})
+        "usage":terminal["usage"],"qwasar_metrics":terminal["metrics"],"status":terminal["status"]});
+    if let Some(ids) = terminal.get("token_ids").filter(|value| value.is_array()) {
+        result["token_ids"] = ids.clone();
+    }
+    result
 }
 
 pub fn response_result(id: &str, terminal: &Value) -> Value {
@@ -1022,9 +1046,13 @@ pub fn response_result(id: &str, terminal: &Value) -> Value {
             output.push(json!({"id":format!("fc_{}",call["id"].as_str().unwrap_or("unknown")),"type":"function_call","status":"completed","call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"]}));
         }
     }
-    json!({"id":id,"object":"response","created_at":terminal["created_at"].as_u64().unwrap_or_else(now),"model":MODEL,"status":terminal["status"],"output":output,
+    let mut result = json!({"id":id,"object":"response","created_at":terminal["created_at"].as_u64().unwrap_or_else(now),"model":MODEL,"status":terminal["status"],"output":output,
         "error":terminal["error"],"incomplete_details":if terminal["status"] == "incomplete" && output_limit_incomplete(terminal) {json!({"reason":"max_output_tokens"})} else {Value::Null},
-        "usage":{"input_tokens":terminal["usage"]["prompt_tokens"],"output_tokens":terminal["usage"]["completion_tokens"],"total_tokens":terminal["usage"]["total_tokens"],"input_tokens_details":terminal["usage"]["prompt_tokens_details"]},"qwasar_metrics":terminal["metrics"]})
+        "usage":{"input_tokens":terminal["usage"]["prompt_tokens"],"output_tokens":terminal["usage"]["completion_tokens"],"total_tokens":terminal["usage"]["total_tokens"],"input_tokens_details":terminal["usage"]["prompt_tokens_details"]},"qwasar_metrics":terminal["metrics"]});
+    if let Some(ids) = terminal.get("token_ids").filter(|value| value.is_array()) {
+        result["token_ids"] = ids.clone();
+    }
+    result
 }
 
 pub fn chat_chunk(id: &str, delta: Value, finish: Value) -> Value {

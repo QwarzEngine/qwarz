@@ -138,13 +138,24 @@ def apply_layer(residual, index, spec, states, caches, cache_len, pages, inv_fre
     return residual + produced, normed, sublayer, produced
 
 
-def logits(model, residual):
-    normed = rms(model.tensor("model.language_model.norm.weight"), residual)
+def _output_head(model):
+    """The final norm and lm_head stay resident. Reloading them each token rereads the trellis."""
+    cached = getattr(model, "_output_head", None)
+    if cached is not None:
+        return cached
+    weight = model.tensor("model.language_model.norm.weight")
     head = model.group("lm_head")
     layer = exl3(
         "lm_head", head["trellis"], head["suh"], head["svh"], head["mul1"],
         248320, HIDDEN, torch.float16,
     )
+    model._output_head = (weight, layer)
+    return model._output_head
+
+
+def logits(model, residual):
+    weight, layer = _output_head(model)
+    normed = rms(weight, residual)
     return layer.forward(normed, {})
 
 

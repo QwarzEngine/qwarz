@@ -210,15 +210,20 @@ def test_responses_function_call_lifecycle_and_parent_result(tmp_path):
             assert json.load(response)["status"] == "completed"
 
 
-def test_responses_without_reasoning_uses_message_index_zero(tmp_path):
+def test_responses_keep_reasoning_when_the_client_turns_effort_off(tmp_path):
     with server(tmp_path) as base:
         with request(base, "/v1/responses", {"model": "qwasar-qwen38-27b", "input": "hello",
                      "max_output_tokens": 64, "stream": True, "reasoning": {"effort": "off"}}) as response:
             events = list(payloads(response))
+        kinds = {}
         for event in events:
-            if "output_index" in event:
-                assert event["output_index"] == 0
-        assert events[-1]["response"]["output"][0]["type"] == "message"
+            if event["type"] == "response.output_item.added":
+                kinds[event["output_index"]] = event["item"]["type"]
+        assert kinds[0] == "reasoning"
+        assert kinds[1] == "message"
+        output = events[-1]["response"]["output"]
+        assert [item["type"] for item in output] == ["reasoning", "message"]
+        assert "Fake reasoning" in output[0]["summary"][0]["text"]
 
 
 def test_stream_usage_opt_out_is_preserved_on_idempotent_replay(tmp_path):
@@ -320,8 +325,8 @@ def test_anthropic_messages_stream_tools_and_count_tokens(tmp_path):
         assert message["type"] == "message"
         assert message["role"] == "assistant"
         assert message["stop_reason"] == "end_turn"
-        assert message["content"][0]["type"] == "text"
-        assert message["content"][0]["text"]
+        text = next(block for block in message["content"] if block["type"] == "text")
+        assert text["text"]
         with request(base, "/v1/messages", anthropic_body(
                 model="claude-sonnet-4-6", thinking={"type": "disabled"})) as response:
             aliased = json.load(response)
@@ -391,4 +396,4 @@ def test_rejected_tool_call_is_not_reported_as_length(tmp_path):
                      chat_template_kwargs={"enable_thinking": False}, max_tokens=2)) as response:
             truncated = json.load(response)
         assert truncated["choices"][0]["finish_reason"] == "length"
-        assert truncated["qwasar_metrics"]["incomplete_reason"] == "max_new_tokens"
+        assert truncated["qwasar_metrics"]["incomplete_reason"] == "reasoning_budget"

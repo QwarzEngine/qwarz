@@ -8,7 +8,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
-from engine.forward.vision import MM_TOKEN_BASE
+from engine.forward.vision import MM_TOKEN_BASE, text_table_ids
 
 VISION_START = 248053
 VISION_END = 248054
@@ -20,8 +20,13 @@ def embed_image(model_dir, image):
     from exllamav3.model.model import Model
     import torch
 
+    from qwasar_runtime.vision import max_pixels_setting
+
     directory = Path(model_dir)
     config = Config.from_directory(directory)
+    vision_pp = getattr(config, "vision_pp", None)
+    if vision_pp is not None and hasattr(vision_pp, "max_pixels"):
+        vision_pp.max_pixels = max_pixels_setting()
     tower = Model.from_config(config, component="vision")
     tower.load(device="cuda:0")
     try:
@@ -52,10 +57,9 @@ def mix_rows(table, ids, rows, dynamic_ids):
     import torch
 
     from engine.forward.embed import gather
-    from engine.forward.vision import MM_TOKEN_BASE
 
     lookup = {token: index for index, token in enumerate(dynamic_ids)}
-    plain = [0 if token >= MM_TOKEN_BASE else token for token in ids]
+    plain = text_table_ids(ids)
     gathered = gather(table, torch.tensor([plain], dtype=torch.long), torch.float32).cuda().contiguous()
     placed = rows.float().cuda()
     for position, token in enumerate(ids):
@@ -83,6 +87,31 @@ def mrope_freqs(ids, first_index, last_index, grid_thw, merge_size):
         torch.tensor([list(ids)], dtype=torch.long),
         [embedding],
         len(ids),
+    )
+    return freqs.cuda().contiguous()
+
+
+def mrope_table(ids, images, length):
+    """One MRoPE table for every image in the prompt, long enough for the decode."""
+    import torch
+    from types import SimpleNamespace
+
+    from engine.forward.attention import rope
+
+    embeddings = [
+        SimpleNamespace(
+            first_index=image["first_index"],
+            last_index=image["last_index"],
+            grid_thw=image["grid_thw"],
+            mrope_merge_size=image["merge_size"],
+        )
+        for image in images
+    ]
+    width = max(int(length), len(ids))
+    freqs, _offset = rope("cpu").get_mrope_freqs(
+        torch.tensor([list(ids)], dtype=torch.long),
+        embeddings,
+        width,
     )
     return freqs.cuda().contiguous()
 

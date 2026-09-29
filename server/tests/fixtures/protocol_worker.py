@@ -23,6 +23,15 @@ for line in sys.stdin:
     latest = command["request"]["messages"][-1]["content"]
     if mode != "prefill-stall" or latest != "stall":
         emit({"type": "started", "id": response_id})
+    if mode == "split":
+        emit({"type": "delta", "id": response_id, "channel": "content", "text": "ab"})
+        emit({"type": "delta", "id": response_id, "channel": "content", "text": "cd"})
+        message = {"role": "assistant", "content": "abcd", "reasoning_content": "", "tool_calls": []}
+        emit({"type": "terminal", "id": response_id, "status": "completed", "message": message,
+              "usage": {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5},
+              "metrics": {}, "error": None,
+              "snapshot": {"messages": [*command["request"]["messages"], message], "tape": [1, 2]}})
+        continue
     if mode in ("ignore-cancel", "prefill-stall") and latest == "stall":
         while True:
             time.sleep(1)

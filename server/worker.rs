@@ -24,6 +24,46 @@ pub struct WorkerConfig {
     pub cancel_timeout: Duration,
 }
 
+/// Arguments of the child that answers generate.
+///
+/// `qwarz start` leaves `fake` false, so that process is the resident engine.
+/// `--fake-worker` keeps the chat fixture the HTTP contract tests already drive.
+fn worker_arguments(config: &WorkerConfig) -> Vec<String> {
+    let module = if config.fake {
+        "qwasar_runtime.worker"
+    } else {
+        "engine.forward.worker"
+    };
+    let mut args = vec![
+        "-u".into(),
+        "-m".into(),
+        module.into(),
+        "--model".into(),
+        config.model.clone(),
+        "--prefill".into(),
+        config.prefill.clone(),
+        "--context-size".into(),
+        config.context_size.to_string(),
+    ];
+    if config.fake {
+        args.push("--fake".into());
+    }
+    args
+}
+
+fn python_path(root: &std::path::Path) -> String {
+    let mut parts = vec![
+        root.display().to_string(),
+        root.join("src").display().to_string(),
+    ];
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        if !existing.is_empty() && !parts.iter().any(|part| part == &existing) {
+            parts.push(existing);
+        }
+    }
+    parts.join(":")
+}
+
 pub struct Worker {
     writer: tokio::sync::Mutex<Option<ChildStdin>>,
     pending: Mutex<Option<(String, mpsc::Sender<Value>)>>,
@@ -170,19 +210,11 @@ impl Worker {
         while !self.stopping.load(Ordering::Acquire) {
             *self.status.write().unwrap() = json!({"status":"loading"});
             let mut command = Command::new(&config.python);
-            command.args([
-                "-u",
-                "-m",
-                "qwasar_runtime.worker",
-                "--model",
-                &config.model,
-                "--prefill",
-                &config.prefill,
-                "--context-size",
-                &config.context_size.to_string(),
-            ]);
-            if config.fake {
-                command.arg("--fake");
+            command.args(worker_arguments(&config));
+            if let Ok(root) = std::env::current_dir() {
+                command
+                    .current_dir(&root)
+                    .env("PYTHONPATH", python_path(&root));
             }
             command
                 .stdin(Stdio::piped())
@@ -279,5 +311,33 @@ impl Worker {
             }
         }
         *self.status.write().unwrap() = json!({"status":"stopped"});
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(fake: bool) -> WorkerConfig {
+        WorkerConfig {
+            python: "python".into(),
+            model: "/models/Qwen3.8-27B-EXL3-5.0bpw".into(),
+            prefill: "xqa".into(),
+            context_size: 262144,
+            fake,
+            request_timeout: Duration::from_secs(600),
+            cancel_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn production_spawn_is_the_resident_engine() {
+        let args = worker_arguments(&config(false));
+        assert_eq!(args[0], "-u");
+        assert_eq!(args[1], "-m");
+        assert_eq!(args[2], "engine.forward.worker");
+        assert!(args.iter().any(|arg| arg == "xqa"));
+        assert!(!args.iter().any(|arg| arg.contains("qwasar_runtime")));
+        assert!(!args.iter().any(|arg| arg == "--fake"));
     }
 }

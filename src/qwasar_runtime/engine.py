@@ -10,7 +10,7 @@ import re
 import time
 from types import SimpleNamespace
 
-from . import diagnostics, draft_graph, hot_head, rendezvous, vision
+from . import diagnostics, hot_head, vision
 from .parsing import SchemaValidationError, StreamParser, canonical, image_parts, message_key, validate_messages, validate_tools
 from .rendering import REASONING_CLOSE, Prompt, encode, render
 
@@ -707,6 +707,8 @@ class ExLlamaBackend:
             # whole path, QWASAR_RDZ_EMB=0 keeps the embedding on CPU. The
             # install never breaks the boot: on any failure the service runs
             # the stock paths.
+            from . import rendezvous
+
             self._rendezvous = {}
             if rendezvous.ENABLED:
                 try:
@@ -745,6 +747,8 @@ class ExLlamaBackend:
             # the eager walk per batch whenever the shape is unsupported, and
             # never breaks the boot. QWASAR_DRAFT_GRAPH=0 disables it;
             # QWASAR_DRAFT_GRAPH_VALIDATE=N cross-checks the first N verifies.
+            from . import draft_graph
+
             self._draft_graph = {"installed": False, "disabled": True}
             if draft_graph.enabled():
                 if self._rendezvous.get("installed") and self._hot_head.get("installed"):

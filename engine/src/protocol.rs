@@ -1,8 +1,8 @@
-//! JSONL control protocol shared with the Rust supervisor.
+//! JSONL control protocol for the in-binary worker.
 //!
-//! One generation is active at a time. This build accepts the session and
-//! answers `engine_not_linked`: the CUDA kernels are not in the binary yet,
-//! and ExLlamaV3 remains the serving worker.
+//! One generation is active at a time. The process `qwarz` starts is the
+//! resident Python engine (`python -m engine.forward.worker`), not this
+//! binary. This build still answers `engine_not_linked`.
 
 use serde_json::{Value, json};
 

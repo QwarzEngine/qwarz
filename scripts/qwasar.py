@@ -102,7 +102,11 @@ def serve(profile):
     os.set_inheritable(lock, True)
     check_gpu()
     python = os.environ.get("QWASAR_EXLLAMA_PYTHON", str(ROOT.parent / "qwen38-exl3-mia/.venv/bin/python"))
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=cuda_device(), PYTHONPATH=str(ROOT / "src"))
+    pythonpath = [str(ROOT), str(ROOT / "src")]
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        pythonpath.append(existing)
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES=cuda_device(), PYTHONPATH=os.pathsep.join(pythonpath))
     os.chdir(ROOT)
     os.execve(BINARY, [str(BINARY), "--python", python, "--database", str(STATE / "qwasar.db"), "--prefill", profile], environment)
 

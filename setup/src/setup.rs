@@ -751,6 +751,7 @@ Environment="QWASAR_MODEL_PATH={model}"
 Environment="QWASAR_EXLLAMA_PYTHON={python}"{spacer}{donor_line}
 Environment="HF_HUB_OFFLINE=1"
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH={repo}:{repo}/src"
 # The 262K-context stack rides within ~100 MiB of device-full; expandable
 # segments grow in place instead of requiring fresh contiguous blocks.
 Environment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"

@@ -10,9 +10,92 @@ fn pi_request_preserves_tools_and_normalizes_text_parts() {
         "chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":true},
         "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
     }), false, None).unwrap();
-    assert_eq!(request["thinking"], "off");
+    assert_eq!(request["thinking"], "xhigh");
     assert_eq!(request["messages"][1]["content"], "hello");
     assert_eq!(request["tools"][0]["function"]["name"], "read");
+    assert_eq!(request["temperature"].as_f64(), Some(1.0));
+    assert_eq!(request["top_p"].as_f64(), Some(0.95));
+}
+
+#[test]
+fn messages_reasoning_stays_high_when_the_client_turns_it_off() {
+    let plain = api::prepare(
+        &json!({"model":api::MODEL,"messages":[{"role":"user","content":"hi"}]}),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(plain["thinking"], "xhigh");
+    assert_eq!(plain["temperature"].as_f64(), Some(1.0));
+    assert_eq!(plain["top_p"].as_f64(), Some(0.95));
+    let disabled = api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": false}
+        }),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(disabled["thinking"], "xhigh");
+    let switched = api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"enabled": false}
+        }),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(switched["thinking"], "xhigh");
+    for effort in ["off", "none", "low", "medium"] {
+        let request = api::prepare(
+            &json!({
+                "model": api::MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request["thinking"], "xhigh", "{effort}");
+    }
+    let cold = api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0
+        }),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(cold["temperature"].as_f64(), Some(0.0));
+    assert_eq!(cold["thinking"], "xhigh");
+    let warm = api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.3
+        }),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(warm["temperature"].as_f64(), Some(0.3));
+    assert!(api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "banana"
+        }),
+        false,
+        None,
+    )
+    .is_err());
 }
 
 #[test]
@@ -135,6 +218,44 @@ fn wire_completion_distinguishes_tools_length_and_reasoning() {
 }
 
 #[test]
+fn raw_ids_reach_the_worker_request_and_token_ids_stay_on_the_result() {
+    let request = api::prepare(
+        &json!({
+            "model": api::MODEL,
+            "messages": [{"role": "user", "content": "ids"}],
+            "ids": [1000, 1001, 198],
+            "max_new": 8,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": false}
+        }),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(request["ids"], json!([1000, 1001, 198]));
+    assert_eq!(request["max_new"], 8);
+    assert_eq!(request["thinking"], "xhigh");
+    assert_eq!(request["temperature"].as_f64(), Some(0.0));
+    let terminal = json!({
+        "status": "completed",
+        "message": {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []},
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        "metrics": {},
+        "token_ids": [198, 27]
+    });
+    let chat = api::chat_result("resp_ids", &terminal);
+    assert_eq!(chat["token_ids"], json!([198, 27]));
+    assert_eq!(chat["choices"][0]["message"]["content"], "");
+    assert_eq!(chat["choices"][0]["message"]["reasoning_content"], "");
+    let response = api::response_result("resp_ids", &terminal);
+    assert_eq!(response["token_ids"], json!([198, 27]));
+    assert!(response["output"].as_array().unwrap().is_empty());
+    let mut plain = terminal.clone();
+    plain.as_object_mut().unwrap().remove("token_ids");
+    assert!(api::chat_result("resp_plain", &plain).get("token_ids").is_none());
+}
+
+#[test]
 fn omitted_output_limit_is_native_maximum() {
     let responses = api::prepare(
         &json!({"model":api::MODEL,"input":"hello","reasoning":{"effort":"high"}}),
@@ -219,7 +340,7 @@ fn hermes_title_generation_aliases_are_accepted() {
         None,
     )
     .unwrap();
-    assert_eq!(title["thinking"], "off");
+    assert_eq!(title["thinking"], "xhigh");
     assert_eq!(title["max_tokens"], 64);
     let disabled = api::prepare(
         &json!({
@@ -231,7 +352,7 @@ fn hermes_title_generation_aliases_are_accepted() {
         None,
     )
     .unwrap();
-    assert_eq!(disabled["thinking"], "off");
+    assert_eq!(disabled["thinking"], "xhigh");
     let ultra = api::prepare(
         &json!({
             "model": api::MODEL,
@@ -737,7 +858,7 @@ fn anthropic_messages_map_to_chat_and_echo_claude_aliases() {
         "thinking": {"type":"disabled"}
     }))
     .unwrap();
-    assert_eq!(disabled["thinking"], "off");
+    assert_eq!(disabled["thinking"], "xhigh");
     assert!(anthropic::prepare(&json!({
         "model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]
     }))
