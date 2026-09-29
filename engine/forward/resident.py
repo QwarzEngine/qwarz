@@ -11,20 +11,24 @@ import torch
 
 from engine.forward.embed import gather, load_weight
 from engine.forward.mlp import _runtime
-from engine.forward.token import LAYERS, apply_layer, load_spec, logits
+from engine.forward.token import LAYERS, apply_layer, load_spec, logits, rms
+from engine.forward.vision import MM_TOKEN_BASE
 
 
 class ModelRunner:
-    def __init__(self, pages, model_dir=None):
+    def __init__(self, pages, model_dir=None, retain=False):
         self.pages = pages
         self.model_dir = Path(model_dir) if model_dir else Path.home() / "models/Qwen3.8-27B-EXL3-5.0bpw"
+        self.retain = retain
         self.states = {}
         self.caches = {}
+        self.specs = {}
         self.calls = []
         self._model = None
         self._donor = None
         self._table = None
         self.last = None
+        self.hidden = None
 
     def _ensure(self):
         if self._model is not None:
@@ -38,18 +42,36 @@ class ModelRunner:
         self._donor = Catalog(donor_dir())
         self._table = load_weight(torch, self.model_dir)
 
-    def forward(self, token_ids, cache_len):
+    def forward(self, token_ids, cache_len, embedded=None, inv_freq=None):
         self._ensure()
-        ids = torch.tensor([list(token_ids)], dtype=torch.long)
-        residual = gather(self._table, ids, torch.float32).cuda().contiguous()
+        ids = list(token_ids)
+        if any(token >= MM_TOKEN_BASE for token in ids) and embedded is None:
+            raise RuntimeError("image ids need vision rows")
+        if embedded is None:
+            residual = gather(
+                self._table, torch.tensor([ids], dtype=torch.long), torch.float32,
+            ).cuda().contiguous()
+        else:
+            residual = embedded if embedded.is_cuda else embedded.cuda()
+            if residual.dtype != torch.float32:
+                residual = residual.float()
+            if residual.dim() == 2:
+                residual = residual.unsqueeze(0)
+            residual = residual.contiguous()
         for index in range(LAYERS):
-            spec = load_spec(self._model, self._donor, index)
+            spec = self.specs.get(index)
+            if spec is None:
+                spec = load_spec(self._model, self._donor, index)
+                if self.retain:
+                    self.specs[index] = spec
             residual, _normed, _sublayer, _produced = apply_layer(
-                residual, index, spec, self.states, self.caches, cache_len, self.pages,
+                residual, index, spec, self.states, self.caches, cache_len, self.pages, inv_freq,
             )
-            del spec
+            if not self.retain:
+                del spec
         self.calls.append((cache_len, list(token_ids)))
         self.last = residual
+        self.hidden = rms(self._model.tensor("model.language_model.norm.weight"), residual)
         return residual
 
     def predict(self):
@@ -74,3 +96,4 @@ class ModelRunner:
         self.states.clear()
         self.caches.clear()
         self.last = None
+        self.hidden = None

@@ -112,7 +112,7 @@ def project(hidden, weights, name, out_features, in_features, dtype):
     return layer.forward(hidden, {})
 
 
-def rope():
+def rope(device="cuda"):
     settings = RopeSettings(
         head_dim=HEAD_DIM,
         rope_theta=10_000_000,
@@ -126,7 +126,7 @@ def rope():
         },
         rope_style=RopeStyle.NEOX,
     )
-    return RoPE("cuda", settings)
+    return RoPE(device, settings)
 
 
 def empty_cache(pages=1):
@@ -179,7 +179,7 @@ def attend(q, k, v, cache, cache_len=0):
     return adapter(args)
 
 
-def attention_forward(hidden, weights, cache=None, cache_len=0):
+def attention_forward(hidden, weights, cache=None, cache_len=0, inv_freq=None):
     if cache is None:
         cache = empty_cache()
     q_packed = project(hidden, weights, "q_proj", Q_OUT, HIDDEN, torch.float16)
@@ -195,7 +195,7 @@ def attention_forward(hidden, weights, cache=None, cache_len=0):
         positions = torch.tensor([cache_len], dtype=torch.int32, device=hidden.device)
     query, key = rope().apply(
         query, key, 0, positions, None, True,
-        weights["q_norm.weight"], weights["k_norm.weight"], RMS_EPS, 1.0, None, False,
+        weights["q_norm.weight"], weights["k_norm.weight"], RMS_EPS, 1.0, inv_freq, False,
     )
     mixed = attend(query, key, value, cache, cache_len)
     flat = mixed.reshape(1, seqlen, HEADS * HEAD_DIM)

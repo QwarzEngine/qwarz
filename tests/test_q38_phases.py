@@ -1,6 +1,6 @@
 """Resident session, MTP6, vision ids, and the 37-cell cutover lock."""
 from engine.forward.gate import GATES, cells, promotion_allowed
-from engine.forward.mtp import DRAFT_TOKENS, acceptance, verify_window
+from engine.forward.mtp import DRAFT_TOKENS, acceptance, emitted_tokens, verify_window
 from engine.forward.schedule import suffix_bounds
 from engine.forward.session import MemoryRunner, Session, SessionBusy
 from engine.forward.vision import MM_TOKEN_BASE, assemble_rows, canonical_tape, embed_spans
@@ -65,6 +65,19 @@ def test_branch_before_the_commit_restarts_from_zero():
     assert session.runner.calls[0][0] == 0
 
 
+def test_emitted_tokens_keep_the_prefix_and_the_bonus():
+    draft = [10, 11, 12, 13, 14, 15]
+    full, matched = emitted_tokens(draft, [10, 11, 12, 13, 14, 15, 50])
+    assert matched == 6
+    assert full == [10, 11, 12, 13, 14, 15, 50]
+    partial, matched = emitted_tokens(draft, [10, 11, 99, 13, 14, 15, 50])
+    assert matched == 2
+    assert partial == [10, 11, 99]
+    corrected, matched = emitted_tokens(draft, [198, 11, 12, 13, 14, 15, 50])
+    assert matched == 0
+    assert corrected == [198]
+
+
 def test_mtp6_keeps_the_matching_prefix_and_rewinds_the_rest():
     session = Session(MemoryRunner())
     session.turn([1, 2, 3, 4])
@@ -122,6 +135,18 @@ def test_worker_advertises_mtp6_and_refuses_promotion_without_the_matrix():
     assert follow[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
 
 
+def test_archived_matrix_is_the_37_cells():
+    from pathlib import Path
+    import pytest
+    path = Path("results/20260910-quality-gate/prompts-phase2.json")
+    if not path.is_file():
+        pytest.skip("archived matrix prompts are not in this tree")
+    from engine.forward.matrix import load_archived
+    rows = load_archived(path)
+    assert len(rows) == 37
+    assert all(isinstance(row["prompt_ids"], list) and row["prompt_ids"] for row in rows)
+
+
 def test_resident_model_keeps_token_198_and_a_suffix_cursor():
     import pytest
     torch = pytest.importorskip("torch")
@@ -141,6 +166,179 @@ def test_resident_model_keeps_token_198_and_a_suffix_cursor():
     assert follow["cached_tokens"] == 64
     assert follow["forwarded"][0][0] == 64
     assert session.runner.calls[0][0] == 64
+
+
+def test_mtp6_window_matches_greedy_on_the_short_prompt():
+    import pytest
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or "RTX 5090" not in torch.cuda.get_device_name(0):
+        pytest.skip("needs the visible RTX 5090")
+    from engine.forward.cycle import continue_drafted
+    from engine.forward.embed import prompt_ids
+    from engine.forward.matrix import continue_greedy
+    from engine.forward.resident import ModelRunner
+
+    ids = prompt_ids(torch, 64).view(-1).tolist()
+    runner = ModelRunner(pages=1, retain=True)
+    reference = continue_greedy(runner, ids, stop_ids=set(), max_new=8)
+    assert reference[0] == 198
+    runner.reset()
+    drafted, cycle = continue_drafted(runner, ids, 8)
+    assert drafted == reference
+    assert cycle.accepted + cycle.rejected > 0
+    assert cycle.rate() == cycle.accepted / (cycle.accepted + cycle.rejected)
+
+
+def test_mtp6_draft_matches_exllama_on_the_short_prompt():
+    import gc
+    import os
+    import pytest
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or "RTX 5090" not in torch.cuda.get_device_name(0):
+        pytest.skip("needs the visible RTX 5090")
+    os.environ["QWASAR_HOT64K"] = "0"
+    os.environ["QWASAR_RDZ"] = "0"
+    os.environ["QWASAR_DRAFT_GRAPH"] = "0"
+    from engine.forward.draft import MTPDraft
+    from engine.forward.embed import prompt_ids
+    from engine.forward.resident import ModelRunner
+    from engine.forward.token import rms
+
+    ids = prompt_ids(torch, 64).view(-1).tolist()
+    runner = ModelRunner(pages=1)
+    residual = runner.forward(ids[:63], 0)
+    hidden = rms(runner._model.tensor("model.language_model.norm.weight"), residual)
+    drafted = MTPDraft(runner._model, runner._table).propose(ids[:63], hidden, ids[63])
+    del runner, residual, hidden
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from exllamav3 import Job
+    from exllamav3.generator.sampler.presets import GreedySampler
+    from qwasar_runtime.engine import ExLlamaBackend
+
+    backend = ExLlamaBackend(os.path.expanduser("~/models/Qwen3.8-27B-EXL3-5.0bpw"), 32768, prefill="xqa")
+    generator = backend.generator
+    captured = []
+    original = generator.iterate_draftmodel_mtp_gen
+
+    def wrap(results):
+        drafted_ids = original(results)
+        if drafted_ids is not None and not captured:
+            captured.append(drafted_ids[0].detach().cpu().tolist())
+        return drafted_ids
+
+    generator.iterate_draftmodel_mtp_gen = wrap
+    generator.enqueue(Job(
+        input_ids=torch.tensor([ids], dtype=torch.long), max_new_tokens=1,
+        sampler=GreedySampler(), seed=20260928, stop_conditions=[],
+    ))
+    while generator.num_remaining_jobs():
+        generator.iterate()
+    assert captured and captured[0] == drafted
+
+
+def test_vision_tower_frames_dynamic_image_ids():
+    import io
+    import os
+    import pytest
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or "RTX 5090" not in torch.cuda.get_device_name(0):
+        pytest.skip("needs the visible RTX 5090")
+    from PIL import Image
+    from engine.forward.vision import MM_TOKEN_BASE, assemble_rows
+    from engine.forward.vision_tower import VISION_END, VISION_START, embed_image, png_bytes
+
+    image = Image.open(io.BytesIO(png_bytes(64, 64)))
+    embedded = embed_image(os.path.expanduser("~/models/Qwen3.8-27B-EXL3-5.0bpw"), image)
+    tokens = embedded["tokens"]
+    assert tokens[0] == VISION_START and tokens[-1] == VISION_END
+    assert embedded["dynamic_ids"]
+    assert all(token >= MM_TOKEN_BASE for token in embedded["dynamic_ids"])
+    seen = []
+    assemble_rows(tokens, lambda token: seen.append(("text", token)), lambda token: seen.append(("image", token)))
+    assert [item for item in seen if item[0] == "image"] == [("image", token) for token in embedded["dynamic_ids"]]
+    assert seen[0] == ("text", VISION_START)
+    assert seen[-1] == ("text", VISION_END)
+
+
+def test_vision_rows_match_exllama_on_a_short_prompt():
+    import gc
+    import io
+    import os
+    import pytest
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or "RTX 5090" not in torch.cuda.get_device_name(0):
+        pytest.skip("needs the visible RTX 5090")
+    os.environ["QWASAR_HOT64K"] = "0"
+    os.environ["QWASAR_RDZ"] = "0"
+    os.environ["QWASAR_DRAFT_GRAPH"] = "0"
+    from PIL import Image
+    from exllamav3.tokenizer.mm_embedding import MMEmbedding
+    from engine.forward.embed import prompt_ids
+    from engine.forward.resident import ModelRunner
+    from engine.forward.vision_tower import embed_image, mix_rows, mrope_freqs, png_bytes
+
+    image = Image.open(io.BytesIO(png_bytes(64, 64)))
+    embedded = embed_image(os.path.expanduser("~/models/Qwen3.8-27B-EXL3-5.0bpw"), image)
+    text = prompt_ids(torch, 8).view(-1).tolist()
+    ids = text[:4] + embedded["tokens"] + text[4:]
+    if len(ids) == 63:
+        ids.append(text[0])
+    pages = len(ids) // 256 + 1
+    runner = ModelRunner(pages=pages, retain=True)
+    runner._ensure()
+    residual = mix_rows(runner._table, ids, embedded["rows"], embedded["dynamic_ids"])
+    freqs = mrope_freqs(
+        ids, embedded["first_index"], embedded["last_index"],
+        embedded["grid_thw"], embedded["merge_size"],
+    )
+    runner.forward(ids, 0, embedded=residual, inv_freq=freqs)
+    token = runner.predict()
+    rows = embedded["rows"].detach().cpu()
+    frame = {
+        "grid_thw": embedded["grid_thw"],
+        "merge_size": embedded["merge_size"],
+        "first_index": embedded["first_index"],
+        "last_index": embedded["last_index"],
+        "dynamic": len(embedded["dynamic_ids"]),
+    }
+    del runner, residual, freqs, embedded
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from exllamav3 import Job
+    from exllamav3.generator.sampler.presets import GreedySampler
+    from qwasar_runtime.engine import ExLlamaBackend
+
+    oracle = MMEmbedding(imp={
+        "metadata": {},
+        "full_length": len(ids),
+        "mm_length": frame["dynamic"],
+        "first_index": frame["first_index"],
+        "last_index": frame["last_index"],
+        "text_alias": "",
+        "grid_thw": frame["grid_thw"],
+        "mrope_merge_size": frame["merge_size"],
+        "embeddings": rows.cuda().contiguous(),
+        "deepstack_embeddings": None,
+    })
+    backend = ExLlamaBackend(os.path.expanduser("~/models/Qwen3.8-27B-EXL3-5.0bpw"), 32768, prefill="xqa")
+    seen = []
+    backend.generator.enqueue(Job(
+        input_ids=torch.tensor([ids], dtype=torch.long),
+        max_new_tokens=1,
+        sampler=GreedySampler(),
+        seed=20260928,
+        stop_conditions=[],
+        embeddings=[oracle],
+    ))
+    while backend.generator.num_remaining_jobs():
+        for result in backend.generator.iterate():
+            produced = result.get("token_ids")
+            if produced is not None:
+                seen.extend(int(item) for item in produced.view(-1).tolist())
+    assert seen and seen[0] == token
 
 
 def test_open_turn_rejects_a_nested_session_turn():

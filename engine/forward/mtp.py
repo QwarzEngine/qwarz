@@ -29,6 +29,23 @@ def acceptance(accepted, rejected):
     return accepted / total
 
 
+def emitted_tokens(draft, samples):
+    """Keep the matching draft prefix, then the target sample at the first mismatch.
+
+    `samples` has one argmax per draft token plus the bonus argmax after the
+    last draft token. A full match keeps that bonus. The held prompt token is
+    not part of the result.
+    """
+    draft = list(draft)
+    samples = list(samples)
+    if len(samples) != len(draft) + 1:
+        raise ValueError("the target returns one sample per draft token plus the bonus")
+    matched = accepted_prefix(draft, samples)
+    if matched == len(draft):
+        return draft + [samples[-1]], matched
+    return draft[:matched] + [samples[matched]], matched
+
+
 def verify_window(session, draft, verified, bonus):
     """Speculatively write the draft, then rewind and commit the kept tokens."""
     draft = list(draft)

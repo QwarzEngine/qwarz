@@ -116,11 +116,11 @@ def load_spec(model, donor, index):
     }
 
 
-def apply_layer(residual, index, spec, states, caches, cache_len, pages):
+def apply_layer(residual, index, spec, states, caches, cache_len, pages, inv_freq=None):
     normed = rms(spec["in_norm"], residual)
     if spec["kind"] == "attn":
         caches.setdefault(index, empty_cache(pages))
-        sublayer, _ = attention_forward(normed, spec["weights"], caches[index], cache_len)
+        sublayer, _ = attention_forward(normed, spec["weights"], caches[index], cache_len, inv_freq)
     else:
         states.setdefault(index, GDNState())
         sublayer = gdn_forward(normed, spec["weights"], states[index])[0]
