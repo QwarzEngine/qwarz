@@ -139,6 +139,7 @@ class Session:
                 accepted = self.cycle.accepted if self.cycle is not None else 0
                 rejected = self.cycle.rejected if self.cycle is not None else 0
                 produced = list(cancelled.produced)
+                prefill_s = getattr(self.cycle, "host_prefill_s", None) if self.cycle is not None else None
                 self.cancel()
                 return {
                     "status": "cancelled",
@@ -147,6 +148,7 @@ class Session:
                     "cursor": self.cursor,
                     "accepted": accepted,
                     "rejected": rejected,
+                    "host_prefill_s": prefill_s,
                 }
             if self.cycle.cache_len != len(ids) + len(self.cycle.tokens) - 1:
                 raise RuntimeError("drafted cache diverged from the emitted tokens")
@@ -162,6 +164,7 @@ class Session:
                 "cursor": self.cursor,
                 "accepted": accepted,
                 "rejected": rejected,
+                "host_prefill_s": getattr(self.cycle, "host_prefill_s", None),
             }
         except SessionBusy:
             raise

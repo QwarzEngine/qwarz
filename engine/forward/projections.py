@@ -70,6 +70,22 @@ def exl3(name, trellis, suh, svh, mul1, out_features, in_features=5120, out_dtyp
     )
 
 
+def cached_exl3(weights, name, trellis, suh, svh, mul1, out_features, in_features=5120, out_dtype=torch.float):
+    """Reuse one BC_LinearEXL3 for this resident weight group.
+
+    Building the module constructs the Blackwell GEMM every call. The cache
+    lives on the weight group, not on a process-wide pointer, so a later
+    load of the same artifact does not revive a freed module.
+    """
+    cache = weights.setdefault("_linears", {})
+    key = (name, int(out_features), int(in_features), out_dtype)
+    layer = cache.get(key)
+    if layer is None:
+        layer = exl3(name, trellis, suh, svh, mul1, out_features, in_features, out_dtype)
+        cache[key] = layer
+    return layer
+
+
 def load_layer(model, index=0):
     prefix = f"model.language_model.layers.{index}.linear_attn"
     with safe_open(model / "model-00001-of-00003.safetensors", framework="pt", device="cpu") as handle:
@@ -78,10 +94,18 @@ def load_layer(model, index=0):
     return got
 
 
-def fp16_project(hidden, stored):
+def fp16_project(hidden, stored, weights=None, name=None):
     """LinearFP16 keeps the transposed weight and writes a float32 hgemm."""
     rows = hidden.reshape(-1, hidden.shape[-1]).contiguous()
-    weight = stored.transpose(0, 1).contiguous()
+    weight = None
+    if weights is not None and name is not None:
+        table = weights.setdefault("_fp16", {})
+        weight = table.get(name)
+        if weight is None:
+            weight = stored.transpose(0, 1).contiguous()
+            table[name] = weight
+    if weight is None:
+        weight = stored.transpose(0, 1).contiguous()
     out = torch.empty((rows.shape[0], stored.shape[0]), dtype=torch.float32, device=rows.device)
     ext.hgemm(rows, weight, out)
     return out.view(*hidden.shape[:-1], stored.shape[0])
@@ -89,12 +113,18 @@ def fp16_project(hidden, stored):
 
 def project(hidden, weights):
     # 63 rows stay on BC_LinearEXL3. Longer prefills take reconstruct_hgemm.
-    qkv = exl3("qkv", weights["in_proj_qkv.trellis"], weights["in_proj_qkv.suh"], weights["in_proj_qkv.svh"], weights["in_proj_qkv.mul1"], QKV_OUT)
-    z_layer = exl3("z", weights["in_proj_z.trellis"], weights["in_proj_z.suh"], weights["in_proj_z.svh"], weights["in_proj_z.mul1"], Z_OUT)
+    qkv = cached_exl3(
+        weights, "qkv", weights["in_proj_qkv.trellis"], weights["in_proj_qkv.suh"],
+        weights["in_proj_qkv.svh"], weights["in_proj_qkv.mul1"], QKV_OUT,
+    )
+    z_layer = cached_exl3(
+        weights, "z", weights["in_proj_z.trellis"], weights["in_proj_z.suh"],
+        weights["in_proj_z.svh"], weights["in_proj_z.mul1"], Z_OUT,
+    )
     qkv_out = qkv.forward(hidden, {})
     z = z_layer.forward(hidden, {}).view(1, hidden.shape[1], NUM_V_HEADS, HEAD_DIM)
-    b = fp16_project(hidden, weights["in_proj_b.weight"])
-    a = fp16_project(hidden, weights["in_proj_a.weight"])
+    b = fp16_project(hidden, weights["in_proj_b.weight"], weights, "in_proj_b.weight")
+    a = fp16_project(hidden, weights["in_proj_a.weight"], weights, "in_proj_a.weight")
     return qkv_out, z, b, a
 
 
@@ -120,6 +150,64 @@ def _capture_chunk(mixed_qkv, beta, g, recurrent):
     return core
 
 
+def _remember_window(state, mixed, beta, g, conv, bias):
+    """Keep the inputs of a short recurrent chunk so it can be cut later.
+
+    The fused rule updates the state to the end of the chunk. One reused
+    buffer holds the pre-chunk state; seven full copies would be about a
+    gigabyte. Prefill above eight tokens does not take this path.
+    """
+    length = mixed.shape[-1]
+    remembered = state._rewind_mixed
+    if remembered is None or remembered.shape[-1] != length:
+        state._rewind_mixed = mixed.clone()
+        state._rewind_beta = beta.clone()
+        state._rewind_g = g.clone()
+    else:
+        state._rewind_mixed.copy_(mixed)
+        state._rewind_beta.copy_(beta)
+        state._rewind_g.copy_(g)
+    if state._rewind_conv is None:
+        state._rewind_conv = state.conv.clone()
+        state._rewind_recurrent = state.recurrent.clone()
+    else:
+        state._rewind_conv.copy_(state.conv)
+        state._rewind_recurrent.copy_(state.recurrent)
+    state._rewind_weight = conv
+    state._rewind_bias = bias
+    state._rewind_len = length
+
+
+def rewind_gdn_state(state, keep):
+    """Move one GDN state from the end of the stashed chunk back to ``keep``."""
+    length = state._rewind_len
+    if length is None:
+        raise RuntimeError("no short GDN window to rewind")
+    state._rewind_len = None
+    if keep == length:
+        return
+    state.conv.copy_(state._rewind_conv)
+    state.recurrent.copy_(state._rewind_recurrent)
+    if keep == 0:
+        return
+    if not 1 <= keep < length:
+        raise RuntimeError(f"cannot rewind a {length}-token GDN window to {keep}")
+    from exllamav3.modules.gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
+
+    mixed = state._rewind_mixed[:, :, :keep].contiguous()
+    beta = state._rewind_beta[:, :keep].contiguous()
+    g = state._rewind_g[:, :keep].contiguous()
+    slots = torch.arange(mixed.shape[0], device=mixed.device, dtype=torch.int32)
+    conv_out = causal_conv1d_update(
+        mixed, state.conv, slots, state._rewind_weight, state._rewind_bias, False, {},
+    )
+    gated_delta_rule_fn(
+        conv_out, beta, g, state.recurrent, slots, False, True,
+        NUM_K_HEADS, NUM_V_HEADS, NUM_K_HEADS * HEAD_DIM, NUM_V_HEADS * HEAD_DIM,
+        HEAD_DIM, HEAD_DIM, {},
+    )
+
+
 def gdn_forward(hidden, weights, state=None):
     from exllamav3.modules.gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 
@@ -131,15 +219,22 @@ def gdn_forward(hidden, weights, state=None):
     # that one value moves the layer-2 state. This is the kernel the oracle runs.
     ext.gated_delta_net_fused_op_2(b, a, weights["dt_bias"], weights["A_log"], beta, g, 1.0)
     mixed = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
-    conv = weights["conv1d.weight"]
-    if conv.dim() == 3:
-        conv = conv.squeeze(1).contiguous()
+    conv = weights.get("_conv1d")
+    if conv is None:
+        raw = weights["conv1d.weight"]
+        conv = raw.squeeze(1).contiguous() if raw.dim() == 3 else raw
+        weights["_conv1d"] = conv
+    bias = weights.get("conv1d.bias")
     # Prefill longer than 32 tokens uses ExLlama's Triton conv. At 63 tokens
     # the delta rule is the chunk kernel, because the length reaches the 48
     # value heads. The ported recurrent kernel remains the short decode path.
+    # A verify is 2..8 tokens. Stash that chunk so the state can be cut
+    # without a second 64-layer pass. A one-token step has nothing to cut.
+    if state is not None and 1 < seqlen <= 8:
+        _remember_window(state, mixed, beta, g, conv, bias)
     slots = None if state is None else torch.arange(hidden.shape[0], device=hidden.device, dtype=torch.int32)
     conv_out = causal_conv1d_update(
-        mixed, None if state is None else state.conv, slots, conv, weights.get("conv1d.bias"), False, {},
+        mixed, None if state is None else state.conv, slots, conv, bias, False, {},
     )
     if state is None:
         core = gated_delta_rule_fn(
@@ -159,8 +254,8 @@ def gdn_forward(hidden, weights, state=None):
     y = torch.empty_like(core, dtype=torch.float16)
     ext.gated_rms_norm(core, weights["norm.weight"], y, z, 1e-6, 0.0, 1, False)
     flat = y.view(1, seqlen, Z_OUT)
-    out_layer = exl3(
-        "out", weights["out_proj.trellis"], weights["out_proj.suh"], weights["out_proj.svh"],
+    out_layer = cached_exl3(
+        weights, "out", weights["out_proj.trellis"], weights["out_proj.suh"], weights["out_proj.svh"],
         weights["out_proj.mul1"], 5120, Z_OUT,
     )
     return out_layer.forward(flat, {}), qkv, z, a, b

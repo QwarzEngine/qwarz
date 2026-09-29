@@ -31,7 +31,7 @@ from engine.forward.mlp import (
 )
 from engine.forward.projections import (
     ORACLE_GDN_OUTPUT,
-    exl3,
+    cached_exl3,
     gdn_forward,
     load_layer,
     sha256,
@@ -99,7 +99,8 @@ def load_attention(model):
 
 
 def project(hidden, weights, name, out_features, in_features, dtype):
-    layer = exl3(
+    layer = cached_exl3(
+        weights,
         name,
         weights[f"{name}.trellis"],
         weights[f"{name}.suh"],
@@ -112,21 +113,47 @@ def project(hidden, weights, name, out_features, in_features, dtype):
     return layer.forward(hidden, {})
 
 
+_ROPES = {}
+
+
 def rope(device="cuda"):
-    settings = RopeSettings(
-        head_dim=HEAD_DIM,
-        rope_theta=10_000_000,
-        partial_rotary_factor=0.25,
-        rope_scaling={
-            "rope_type": "default",
-            "rope_theta": 10_000_000,
-            "partial_rotary_factor": 0.25,
-            "mrope_interleaved": True,
-            "mrope_section": [11, 11, 10],
-        },
-        rope_style=RopeStyle.NEOX,
-    )
-    return RoPE(device, settings)
+    key = str(torch.device(device))
+    cached = _ROPES.get(key)
+    if cached is None:
+        settings = RopeSettings(
+            head_dim=HEAD_DIM,
+            rope_theta=10_000_000,
+            partial_rotary_factor=0.25,
+            rope_scaling={
+                "rope_type": "default",
+                "rope_theta": 10_000_000,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+            },
+            rope_style=RopeStyle.NEOX,
+        )
+        cached = RoPE(device, settings)
+        _ROPES[key] = cached
+    return cached
+
+
+_ZERO_LENS = {}
+
+
+def cache_seqlens(cache_len, device):
+    """One int32 length. A tensor is already on device and is reused by a CUDA graph."""
+    if isinstance(cache_len, int):
+        if cache_len == 0:
+            # The cold prefill graph cannot allocate this scalar while it is recording.
+            key = str(device)
+            tensor = _ZERO_LENS.get(key)
+            if tensor is None:
+                tensor = torch.zeros(1, dtype=torch.int32, device=device)
+                _ZERO_LENS[key] = tensor
+            return tensor, 0
+        return torch.tensor([cache_len], dtype=torch.int32, device=device), cache_len
+    return cache_len, None
 
 
 def empty_cache(pages=1):
@@ -140,16 +167,61 @@ def empty_cache(pages=1):
     )
 
 
+_ADAPTER = None
+_BLOCK_TABLES = {}
+_BOUND_PAGES = None
+
+
+def bind_table_pages(pages):
+    """Publish only the first ``pages`` identity entries on the next attend.
+
+    XQA takes its max sequence from the table width. A 7-token verify on a
+    1024-page cache would otherwise walk the whole 262144-token allocation.
+    ``None`` restores the full table. The caller clears this before returning.
+    """
+    global _BOUND_PAGES
+    _BOUND_PAGES = pages
+
+
+def _block_table(pages, device):
+    key = (pages, str(device))
+    table = _BLOCK_TABLES.get(key)
+    if table is None:
+        table = torch.arange(pages, dtype=torch.int32, device=device).view(1, pages)
+        _BLOCK_TABLES[key] = table
+    return table
+
+
+def release_attention_plans():
+    """Drop per-cache attention plans. The KV pages themselves live on the runner."""
+    global _BOUND_PAGES
+    _BOUND_PAGES = None
+    if _ADAPTER is not None:
+        _ADAPTER.layer_states.clear()
+
+
 def attend(q, k, v, cache, cache_len=0):
+    global _ADAPTER
     _runtime()
     from qwasar_runtime.hybrid import prepare_environment
     from qwasar_runtime.xqa import NVFP4AttentionAdapter
 
     prepare_environment()
     import flashinfer
+    if _ADAPTER is None:
+        # Nested graphs cannot record XQA's own graph launch. Decode stays eager
+        # here; an outer graph, if one is captured, replays this eager call.
+        _ADAPTER = NVFP4AttentionAdapter("nvfp4-xqa", flashinfer, prefill="prims", decode_graphs=False)
     k_cache, v_cache, k_scales, v_scales = cache
     seqlen = q.shape[1]
     pages = k_cache.shape[0]
+    # Eager prefill passes a Python length. The flash path would otherwise
+    # copy that same length back off the device on every layer.
+    _ADAPTER._host_cache_len = cache_len if isinstance(cache_len, int) else None
+    table = _block_table(pages, q.device)
+    bound = _BOUND_PAGES
+    if bound is not None and bound < table.shape[1]:
+        table = table.narrow(1, 0, bound)
     args = AttnArgs(
         bsz=1,
         q_len=seqlen,
@@ -168,15 +240,14 @@ def attend(q, k, v, cache, cache_len=0):
         max_seqlen=None,
         window_size=None,
         softcap=0.0,
-        block_table=torch.arange(pages, dtype=torch.int32, device=q.device).view(1, pages),
-        cache_seqlens=torch.tensor([cache_len], dtype=torch.int32, device=q.device),
+        block_table=table,
+        cache_seqlens=cache_seqlens(cache_len, q.device)[0],
         k_scales=k_scales,
         v_scales=v_scales,
     )
     # Q>=8192 gathers NVFP4 and attends with PRIMS. Shorter prefills use SDPA.
     # A single token uses XQA over the same pages.
-    adapter = NVFP4AttentionAdapter("nvfp4-xqa", flashinfer, prefill="prims", decode_graphs=False)
-    return adapter(args)
+    return _ADAPTER(args)
 
 
 def attention_forward(hidden, weights, cache=None, cache_len=0, inv_freq=None):
@@ -190,9 +261,9 @@ def attention_forward(hidden, weights, cache=None, cache_len=0, inv_freq=None):
     key = project(hidden, weights, "k_proj", KV_OUT, HIDDEN, torch.float16).view(1, seqlen, KV_HEADS, HEAD_DIM)
     value = project(hidden, weights, "v_proj", KV_OUT, HIDDEN, torch.float16).view(1, seqlen, KV_HEADS, HEAD_DIM)
     # A later chunk starts at cache_len. The first chunk keeps the zero origin.
-    positions = None
-    if cache_len > 0:
-        positions = torch.tensor([cache_len], dtype=torch.int32, device=hidden.device)
+    # A CUDA graph passes the length tensor and always has a past.
+    seqlens, host_len = cache_seqlens(cache_len, hidden.device)
+    positions = None if host_len == 0 else seqlens
     query, key = rope().apply(
         query, key, 0, positions, None, True,
         weights["q_norm.weight"], weights["k_norm.weight"], RMS_EPS, 1.0, inv_freq, False,

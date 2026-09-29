@@ -278,6 +278,48 @@ def _scripted_session(samples):
     return session
 
 
+def test_a_runner_that_can_rewind_skips_the_replay_forward():
+    class Rewinding(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([10, 11, 99, 13, 14, 15, 50])
+            self.rewinds = []
+
+        def rewind_recurrent(self, keep):
+            last_cache, last_ids = self.calls[-1]
+            self.state = last_cache + keep
+            self.rewinds.append(keep)
+
+    session = Session(Rewinding())
+    from engine.forward.cycle import DraftCycle
+
+    session.cycle = DraftCycle(session.runner, draft=session.runner.draft)
+    done = session.generate([1, 2, 3, 4], 3)
+    assert done["tokens"] == [10, 11, 99]
+    assert done["cached_tokens"] == 0
+    assert session.runner.rewinds == [3]
+    assert session.runner.calls == [
+        (0, [1, 2, 3]),
+        (3, [4, 10, 11, 12, 13, 14, 15]),
+    ]
+    assert session.runner.state == 6
+
+
+def test_draft_decode_sees_the_whole_cache():
+    import pytest
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or "RTX 5090" not in torch.cuda.get_device_name(0):
+        pytest.skip("needs the visible RTX 5090")
+    from engine.forward.draft import draft_attend
+
+    length = 4
+    query = torch.zeros(1, 1, 8, 64, device="cuda", dtype=torch.float16)
+    key = torch.zeros(1, length, 2, 64, device="cuda", dtype=torch.float16)
+    value = torch.zeros(1, length, 2, 64, device="cuda", dtype=torch.float16)
+    value[:, :, :, 0] = torch.tensor([1, 2, 3, 4], device="cuda", dtype=torch.float16).view(1, length, 1)
+    seen = draft_attend(query, key, value)
+    assert abs(float(seen[0, 0, 0, 0]) - 2.5) < 1e-3
+
+
 def test_worker_advertises_mtp6_and_refuses_promotion_without_the_matrix():
     session = _scripted_session([42, 0, 0, 0, 0, 0, 0])
     worker = Worker(session)

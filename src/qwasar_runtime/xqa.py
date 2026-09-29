@@ -225,6 +225,10 @@ class _DeviceState:
     scratch_k: torch.Tensor | None = None
     scratch_v: torch.Tensor | None = None
     scratch_shape: tuple[int, int, int, int] | None = None
+    # Power-of-two gather buffers. A captured prefill records one address, so
+    # that capacity stays. Longer prefills reuse the smallest covering buffer.
+    scratches: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    pinned_scratch: set[int] = field(default_factory=set)
     # PRIMS prefill buffers: FP8 pages of 128 tokens plus the FlashInfer wrapper.
     k8: torch.Tensor | None = None
     v8: torch.Tensor | None = None
@@ -275,11 +279,10 @@ class NVFP4AttentionAdapter:
         key = (id(args.k_cache), tuple(args.block_table.shape))
         state = self.layer_states.get(key)
         if state is None:
-            # fresh_generator rebuilds the caches per cell; without a cap the
-            # dead sessions' states (buffers + graph statics) accumulate
-            # across the 37-cell matrix. 16 layers/session -> 64 keeps ~4
-            # sessions and evicts the oldest first.
-            while len(self.layer_states) >= 64:
+            # One resident runner keeps the full prefill table plus a
+            # power-of-two decode bucket on each of the 16 attention layers.
+            # Evicting one of those drops the buffer a CUDA graph still launches.
+            while len(self.layer_states) >= 256:
                 self.layer_states.pop(next(iter(self.layer_states)))
             shape = (
                 args.block_table.shape[0],
@@ -550,36 +553,72 @@ class NVFP4AttentionAdapter:
         )
         return output
 
-    @staticmethod
-    def _live_total(lengths: torch.Tensor, append_len: int) -> int:
-        # Q>8 prefill is deliberately outside CUDA graphs. Read the authoritative
-        # device length on every layer because raw CUDA writes are not reliably
-        # visible through host tensor metadata.
+    def _known_total(self, lengths: torch.Tensor, append_len: int) -> int:
+        # The eager prefill already knows the length it just wrote into
+        # cache_seqlens. Reading it back syncs every attention layer.
+        host = getattr(self, "_host_cache_len", None)
+        if host is not None:
+            return host + append_len
         return int((lengths + append_len).max().item())
 
     @staticmethod
-    def _ensure_scratch(device_state: _DeviceState, args) -> tuple[torch.Tensor, torch.Tensor]:
-        capacity = args.k_cache.shape[0] * DONOR_PAGE_SIZE
-        shape = (args.bsz, capacity, args.num_kv_heads, args.dim)
-        if device_state.scratch_shape != shape:
-            device_state.scratch_k = torch.empty(
-                shape, dtype=torch.float16, device=args.q.device
-            )
-            device_state.scratch_v = torch.empty_like(device_state.scratch_k)
-            device_state.scratch_shape = shape
-        assert device_state.scratch_k is not None and device_state.scratch_v is not None
-        return device_state.scratch_k, device_state.scratch_v
+    def _scratch_capacity(total: int, physical: int) -> int:
+        cap = 1
+        while cap < total:
+            cap <<= 1
+        if cap > physical:
+            return physical
+        return cap
+
+    @staticmethod
+    def _ensure_scratch(device_state: _DeviceState, args, total: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """FP16 gather storage for this sequence, not the whole 262144-token cache.
+
+        The 255-token prefill graph records the buffer it captured. A later
+        chunk must not free that storage. Unpinned shorter buffers are dropped
+        once a larger one covers them, so a short prompt does not hold ~1 GiB.
+        """
+        physical = args.k_cache.shape[0] * DONOR_PAGE_SIZE
+        cap = NVFP4AttentionAdapter._scratch_capacity(total, physical)
+        if cap < total:
+            raise ValueError("logical sequence exceeds the physical NVFP4 cache")
+        chosen = None
+        for existing in sorted(device_state.scratches):
+            if existing >= total:
+                chosen = existing
+                break
+        if chosen is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("fp16 attention scratch must exist before CUDA graph capture")
+            device_state.scratch_k = None
+            device_state.scratch_v = None
+            for old in [
+                key for key in device_state.scratches
+                if key < cap and key not in device_state.pinned_scratch
+            ]:
+                del device_state.scratches[old]
+            shape = (args.bsz, cap, args.num_kv_heads, args.dim)
+            scratch_k = torch.empty(shape, dtype=torch.float16, device=args.q.device)
+            device_state.scratches[cap] = (scratch_k, torch.empty_like(scratch_k))
+            chosen = cap
+        if torch.cuda.is_current_stream_capturing():
+            device_state.pinned_scratch.add(chosen)
+        scratch_k, scratch_v = device_state.scratches[chosen]
+        device_state.scratch_k = scratch_k
+        device_state.scratch_v = scratch_v
+        device_state.scratch_shape = tuple(scratch_k.shape)
+        return scratch_k, scratch_v
 
     def _flash_prefill(self, args, append_len: int) -> torch.Tensor:
         state, device_state = self._layer_state(args)
         self._append(args, append_len)
         self.append_calls += 1
         post_lengths = self._post_lengths(state, args, append_len)
-        total = self._live_total(args.cache_seqlens, append_len)
+        total = self._known_total(args.cache_seqlens, append_len)
         if total > args.k_cache.shape[0] * DONOR_PAGE_SIZE:
             raise ValueError("logical sequence exceeds the physical NVFP4 cache")
         self.max_flash_total = max(self.max_flash_total, total)
-        scratch_k, scratch_v = self._ensure_scratch(device_state, args)
+        scratch_k, scratch_v = self._ensure_scratch(device_state, args, total)
         grid = (args.bsz * total, args.num_kv_heads)
         with torch.cuda.device(args.q.device):
             _gather_nvfp4_kernel[grid](
@@ -648,11 +687,11 @@ class NVFP4AttentionAdapter:
         self._append(args, append_len)
         self.append_calls += 1
         post_lengths = self._post_lengths(state, args, append_len)
-        total = self._live_total(args.cache_seqlens, append_len)
+        total = self._known_total(args.cache_seqlens, append_len)
         if total > args.k_cache.shape[0] * DONOR_PAGE_SIZE:
             raise ValueError("logical sequence exceeds the physical NVFP4 cache")
         self.max_flash_total = max(self.max_flash_total, total)
-        scratch_k, scratch_v = self._ensure_scratch(device_state, args)
+        scratch_k, scratch_v = self._ensure_scratch(device_state, args, total)
         grid = (args.bsz * total, args.num_kv_heads)
         with torch.cuda.device(args.q.device):
             _gather_nvfp4_kernel[grid](
@@ -833,12 +872,11 @@ class NVFP4AttentionAdapter:
         return output
 
     def diagnostics(self) -> dict[str, Any]:
-        scratch_bytes = sum(
-            0
-            if state.scratch_k is None
-            else 2 * state.scratch_k.numel() * state.scratch_k.element_size()
-            for state in self.device_states.values()
-        )
+        scratch_bytes = 0
+        for state in self.device_states.values():
+            for key_tensor, value_tensor in state.scratches.values():
+                scratch_bytes += key_tensor.numel() * key_tensor.element_size()
+                scratch_bytes += value_tensor.numel() * value_tensor.element_size()
         return {
             "mode": self.mode,
             "prefill": self.prefill,

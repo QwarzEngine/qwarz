@@ -60,7 +60,11 @@ def mix_rows(table, ids, rows, dynamic_ids):
 
     lookup = {token: index for index, token in enumerate(dynamic_ids)}
     plain = text_table_ids(ids)
-    gathered = gather(table, torch.tensor([plain], dtype=torch.long), torch.float32).cuda().contiguous()
+    gathered = gather(
+        table, torch.tensor([plain], dtype=torch.long, device=table.device), torch.float32,
+    ).contiguous()
+    if not gathered.is_cuda:
+        gathered = gathered.cuda()
     placed = rows.float().cuda()
     for position, token in enumerate(ids):
         if token >= MM_TOKEN_BASE:

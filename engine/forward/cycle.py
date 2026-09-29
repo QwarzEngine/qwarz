@@ -4,11 +4,14 @@ The target cache keeps every token except the one about to be scored. The
 prompt prefix uses the production page cuts. Each cut exports its post-norm
 state, and that cut's last row is the hidden paired with the first token of
 the next cut. The draft proposes six ids from the held token. One target
-forward scores the held token and the six drafts. The matching prefix is
-written again and the first mismatch, or the bonus token when all six match,
-stays held for the next window.
+forward scores the held token and the six drafts. When the runner can cut
+Gated DeltaNet, that forward's accepted prefix stays in the cache. Otherwise
+the prefix is written again. The first mismatch, or the bonus token when all
+six match, stays held for the next window.
 """
 from __future__ import annotations
+
+import time
 
 from engine.forward.mtp import DRAFT_TOKENS, acceptance, emitted_tokens
 from engine.forward.vision import MM_TOKEN_BASE
@@ -84,12 +87,16 @@ class DraftCycle:
         if self.carry is None:
             raise RuntimeError("draft has no target state")
         self.primed = draft.position
-        token = int(token_id)
-        state = self.carry
-        drafted = []
-        for _ in range(steps):
-            token, state = draft.step(token, state)
-            drafted.append(int(token))
+        roll = getattr(draft, "roll", None)
+        if roll is None:
+            token = int(token_id)
+            state = self.carry
+            drafted = []
+            for _ in range(steps):
+                token, state = draft.step(token, state)
+                drafted.append(int(token))
+            return drafted
+        drafted, _state = roll(int(token_id), self.carry, steps)
         return drafted
 
     def repair(self, verify_hidden, drafted, matched):
@@ -240,21 +247,30 @@ def continue_drafted(
     the last commit. Image rows ride ``embed_ids``; a text turn passes neither.
     """
     cycle = cycle or DraftCycle(runner)
+    sync = getattr(runner, "synchronize", None)
+    timed = callable(sync)
+    if timed:
+        sync()
+        prefill_started = time.perf_counter()
     cache_len, held = prefill_held(
         runner, cycle, prompt, start, embed_ids=embed_ids, inv_freq=inv_freq,
     )
+    if timed:
+        sync()
+        cycle.host_prefill_s = time.perf_counter() - prefill_started
     produced = []
     cycle.overshot = False
+    rewind = getattr(runner, "rewind_recurrent", None)
+    single_pass = callable(rewind)
     while len(produced) < max_new:
         if _stop_requested(cancel):
             raise CancelledTurn(produced)
         drafted = cycle.propose(held, steps)
-        before = runner.capture()
+        before = None if single_pass else runner.capture()
         _forward(runner, [held, *drafted], cache_len, embed_ids, inv_freq)
         samples = _samples(runner, len(drafted) + 1, choose)
         verify_hidden = _snapshot(runner.hidden)
         emitted, matched = emitted_tokens(drafted, samples)
-        runner.restore(before)
         room = max_new - len(produced)
         if len(emitted) > room:
             # The hold is the last returned token. Draft tokens past that
@@ -270,9 +286,17 @@ def continue_drafted(
                     stopped = True
                     break
         if not emitted:
+            if single_pass:
+                rewind(0)
+            else:
+                runner.restore(before)
             break
         body = [held, *emitted[:-1]]
-        _forward(runner, body, cache_len, embed_ids, inv_freq)
+        if single_pass:
+            rewind(len(body))
+        else:
+            runner.restore(before)
+            _forward(runner, body, cache_len, embed_ids, inv_freq)
         cycle.repair(verify_hidden, drafted, matched)
         cache_len += len(body)
         if cycle.draft.position != cache_len:

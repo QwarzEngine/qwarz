@@ -60,6 +60,14 @@ class GDNState:
         self.conv = torch.zeros(1, CONV_DIM, 4, dtype=torch.bfloat16, device="cuda")
         self.recurrent = torch.zeros(1, 1, 48, 128, 128, dtype=torch.float32, device="cuda")
         self.ready = False
+        self._rewind_mixed = None
+        self._rewind_beta = None
+        self._rewind_g = None
+        self._rewind_conv = None
+        self._rewind_recurrent = None
+        self._rewind_weight = None
+        self._rewind_bias = None
+        self._rewind_len = None
 
 
 def load_mlp(donor, index):
@@ -119,20 +127,29 @@ def load_spec(model, donor, index):
 def apply_layer(residual, index, spec, states, caches, cache_len, pages, inv_freq=None):
     normed = rms(spec["in_norm"], residual)
     if spec["kind"] == "attn":
-        caches.setdefault(index, empty_cache(pages))
-        sublayer, _ = attention_forward(normed, spec["weights"], caches[index], cache_len, inv_freq)
+        # setdefault would zero a fresh cache on every call, and the verify
+        # graph replays that fill across the whole NVFP4 allocation.
+        cache = caches.get(index)
+        if cache is None:
+            cache = empty_cache(pages)
+            caches[index] = cache
+        sublayer, _ = attention_forward(normed, spec["weights"], cache, cache_len, inv_freq)
     else:
-        states.setdefault(index, GDNState())
-        sublayer = gdn_forward(normed, spec["weights"], states[index])[0]
-    if cache_len == 0 and residual.shape[1] == 63 and index == 0:
+        state = states.get(index)
+        if state is None:
+            state = GDNState()
+            states[index] = state
+        sublayer = gdn_forward(normed, spec["weights"], state)[0]
+    fresh = isinstance(cache_len, int) and cache_len == 0
+    if fresh and residual.shape[1] == 63 and index == 0:
         if sha256(normed) != ORACLE_GDN_INPUT or sha256(sublayer) != ORACLE_GDN_OUTPUT:
             raise RuntimeError("layer 0 GDN drifted")
-    if cache_len == 0 and residual.shape[1] == 63 and index == 3:
+    if fresh and residual.shape[1] == 63 and index == 3:
         if sha256(normed) != ORACLE_ATTN_INPUT or sha256(sublayer) != ORACLE_ATTN_OUTPUT:
             raise RuntimeError("layer 3 attention drifted")
     entered = fuse(spec["post_norm"], residual, sublayer)
     produced = mlp_forward(entered, spec["mlp"])
-    if cache_len == 0 and residual.shape[1] == 63 and index == 0:
+    if fresh and residual.shape[1] == 63 and index == 0:
         if sha256(entered) != ORACLE_MLP_INPUT or sha256(produced) != ORACLE_MLP_OUTPUT:
             raise RuntimeError("layer 0 MLP drifted")
     return residual + produced, normed, sublayer, produced
@@ -151,6 +168,51 @@ def _output_head(model):
     )
     model._output_head = (weight, layer)
     return model._output_head
+
+
+def _proposer_head(model):
+    """MTP proposer head. The target verifier stays on the full 248320-row head.
+
+    The pinned 65536-token map is the production one. A token outside it is
+    simply never drafted. ``QWASAR_HOT64K=0`` keeps the proposer on the full head.
+    """
+    cached = getattr(model, "_proposer_head", None)
+    if cached is not None:
+        return cached
+    from exllamav3.model.config import NullConfig
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+    from qwasar_runtime.hot_head import SUBSET_VOCAB, enabled, load_blocks
+
+    _weight, full = _output_head(model)
+    if not enabled():
+        model._proposer_head = (full, None)
+        return model._proposer_head
+    blocks = load_blocks()
+    device = full.trellis.device
+    block_idx = torch.tensor(blocks, device=device, dtype=torch.long)
+    token_ids = (
+        block_idx[:, None] * 16 + torch.arange(16, device=device)[None, :]
+    ).reshape(-1)
+    if int(token_ids.numel()) != SUBSET_VOCAB:
+        raise ValueError(
+            f"hot head map covers {int(token_ids.numel())} tokens, expected {SUBSET_VOCAB}"
+        )
+    bias = None if full.bias is None else full.bias.index_select(0, token_ids).contiguous()
+    layer = LinearEXL3(
+        config=NullConfig(),
+        in_features=full.in_features,
+        out_features=SUBSET_VOCAB,
+        suh=full.suh,
+        svh=full.svh.index_select(0, token_ids).contiguous(),
+        trellis=full.trellis.index_select(1, block_idx).contiguous(),
+        mcg=full.mcg_tensor,
+        mul1=full.mul1_tensor,
+        bias=bias,
+        out_dtype=full.out_dtype,
+        key="qwasar.mtp.hot_lm_head_64k",
+    )
+    model._proposer_head = (layer, token_ids)
+    return model._proposer_head
 
 
 def logits(model, residual):
