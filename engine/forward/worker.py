@@ -2,7 +2,8 @@
 
 This is the engine the supervisor can attach later. q38-worker still answers
 engine_not_linked, and qwasar.service is left on ExLlama. One generate is
-active; a second returns 409. Cancel restores the last commit.
+active; a second returns 409. Cancel restores the last commit. A generate
+returns the greedy token ids from the resident MTP6 windows.
 """
 from __future__ import annotations
 
@@ -96,9 +97,14 @@ class Worker:
             return [_terminal(response_id, "failed", {}, {}, {
                 "code": "invalid_request", "message": "generate request needs an ids list", "http_status": 400,
             })]
+        max_new = request.get("max_new", 1)
+        if type(max_new) is not int or max_new < 1:
+            return [_terminal(response_id, "failed", {}, {}, {
+                "code": "invalid_request", "message": "generate needs a positive max_new", "http_status": 400,
+            })]
         self.active = response_id
         try:
-            result = self.session.turn(request["ids"])
+            result = self.session.generate(request["ids"], max_new)
         except SessionBusy as error:
             self.active = None
             return [_terminal(response_id, "failed", {}, {}, {
@@ -111,11 +117,14 @@ class Worker:
             })]
         self.active = None
         cached = result["cached_tokens"]
+        tokens = list(result["tokens"])
         prompt = len(request["ids"])
-        return [_terminal(
+        event = _terminal(
             response_id,
             result["status"],
             {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []},
-            {"prompt_tokens": prompt, "completion_tokens": 0, "total_tokens": prompt,
+            {"prompt_tokens": prompt, "completion_tokens": len(tokens), "total_tokens": prompt + len(tokens),
              "prompt_tokens_details": {"cached_tokens": cached}},
-        )]
+        )
+        event["token_ids"] = tokens
+        return [event]

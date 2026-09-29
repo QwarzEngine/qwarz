@@ -57,7 +57,8 @@ class ModelRunner:
                 residual = residual.float()
             if residual.dim() == 2:
                 residual = residual.unsqueeze(0)
-            residual = residual.contiguous()
+            # The norm fuses the residual in place. A later span still reads this table.
+            residual = residual.contiguous().clone()
         for index in range(LAYERS):
             spec = self.specs.get(index)
             if spec is None:
