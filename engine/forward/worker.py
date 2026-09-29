@@ -104,27 +104,27 @@ class Worker:
             })]
         self.active = response_id
         try:
-            result = self.session.generate(request["ids"], max_new)
-        except SessionBusy as error:
+            try:
+                result = self.session.generate(request["ids"], max_new)
+            except SessionBusy as error:
+                return [_terminal(response_id, "failed", {}, {}, {
+                    "code": error.code, "message": str(error), "http_status": error.http_status,
+                })]
+            except ValueError as error:
+                return [_terminal(response_id, "failed", {}, {}, {
+                    "code": "invalid_request", "message": str(error), "http_status": 400,
+                })]
+            cached = result["cached_tokens"]
+            tokens = list(result["tokens"])
+            prompt = len(request["ids"])
+            event = _terminal(
+                response_id,
+                result["status"],
+                {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []},
+                {"prompt_tokens": prompt, "completion_tokens": len(tokens), "total_tokens": prompt + len(tokens),
+                 "prompt_tokens_details": {"cached_tokens": cached}},
+            )
+            event["token_ids"] = tokens
+            return [event]
+        finally:
             self.active = None
-            return [_terminal(response_id, "failed", {}, {}, {
-                "code": error.code, "message": str(error), "http_status": error.http_status,
-            })]
-        except ValueError as error:
-            self.active = None
-            return [_terminal(response_id, "failed", {}, {}, {
-                "code": "invalid_request", "message": str(error), "http_status": 400,
-            })]
-        self.active = None
-        cached = result["cached_tokens"]
-        tokens = list(result["tokens"])
-        prompt = len(request["ids"])
-        event = _terminal(
-            response_id,
-            result["status"],
-            {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []},
-            {"prompt_tokens": prompt, "completion_tokens": len(tokens), "total_tokens": prompt + len(tokens),
-             "prompt_tokens_details": {"cached_tokens": cached}},
-        )
-        event["token_ids"] = tokens
-        return [event]

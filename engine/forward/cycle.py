@@ -146,6 +146,8 @@ def continue_drafted(runner, prompt, max_new, steps=DRAFT_TOKENS, cycle=None, st
     The prompt prefix uses the same page cuts as a resident turn. Each cut
     exports its post-norm state, and the last row is the hidden paired with
     the first token of the next cut. The final prompt id stays out of the cache.
+    A window that would pass max_new is trimmed before it is repaired, so
+    the hold and the cursor describe only the returned tokens.
     """
     cycle = cycle or DraftCycle(runner)
     cache_len, held = prefill_held(runner, cycle, prompt, start)
@@ -158,6 +160,12 @@ def continue_drafted(runner, prompt, max_new, steps=DRAFT_TOKENS, cycle=None, st
         verify_hidden = _snapshot(runner.hidden)
         emitted, matched = emitted_tokens(drafted, samples)
         runner.restore(before)
+        room = max_new - len(produced)
+        if len(emitted) > room:
+            # The hold is the last returned token. Draft tokens past that
+            # budget are not repaired into the cache.
+            emitted = emitted[:room]
+            matched = len(emitted) - 1
         body = [held, *emitted[:-1]]
         runner.forward(body, cache_len)
         cycle.repair(verify_hidden, drafted, matched)

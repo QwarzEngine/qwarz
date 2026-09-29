@@ -314,6 +314,50 @@ def test_protocol_generate_emits_the_mtp6_window():
     assert session.cycle.rejected == 0
 
 
+def test_a_short_accept_keeps_the_cursor_on_the_returned_tokens():
+    samples = [10, 11, 12, 13, 14, 15, 77]
+    session = _scripted_session(samples)
+    worker = Worker(session)
+    done = worker.push('{"op":"generate","id":"resp_one","request":{"ids":[1,2,3,4],"max_new":1}}')
+    assert done[0]["token_ids"] == [10]
+    assert done[0]["usage"]["completion_tokens"] == 1
+    assert session.cursor == 4
+    assert session.tape == [1, 2, 3, 4]
+    assert session.cycle.draft.position == session.cursor
+    follow = worker.push('{"op":"generate","id":"resp_suffix","request":{"ids":[1,2,3,4,5,6]}}')
+    assert follow[0]["status"] == "completed"
+    assert follow[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+
+    fresh = _scripted_session(samples)
+    Worker(fresh).push('{"op":"generate","id":"resp_hold","request":{"ids":[1,2,3,4],"max_new":1}}')
+    fresh.runner.calls.clear()
+    turned = fresh.turn([1, 2, 3, 4, 10, 20])
+    assert turned["cached_tokens"] == 4
+    assert turned["forwarded"][0][0] == 4
+    assert fresh.runner.calls[0][0] == 4
+
+
+def test_a_diverged_draft_does_not_stick_the_worker():
+    from engine.forward.cycle import DraftCycle
+
+    session = _scripted_session([42, 0, 0, 0, 0, 0, 0])
+    session.cycle.draft.prefill = lambda token_ids, hidden: None
+    worker = Worker(session)
+    try:
+        worker.push('{"op":"generate","id":"resp_bad","request":{"ids":[1,2,3,4]}}')
+    except RuntimeError as error:
+        assert "diverged" in str(error)
+    else:
+        raise AssertionError("a draft that does not advance must fail")
+    assert worker.active is None
+    assert session.busy is False
+    session.cycle = DraftCycle(session.runner, draft=_ScriptedDraft())
+    done = worker.push('{"op":"generate","id":"resp_next","request":{"ids":[1,2,3,4]}}')
+    assert done[0]["status"] == "completed"
+    assert done[0]["token_ids"] == [42]
+    assert worker.active is None
+
+
 def test_archived_matrix_is_the_37_cells():
     from pathlib import Path
     import pytest
