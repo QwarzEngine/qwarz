@@ -202,6 +202,9 @@ class Session:
                 self.cycle = self._new_cycle()
             accepted_before = self.cycle.accepted
             rejected_before = self.cycle.rejected
+            phase_before = list(self.cycle.phase_s)
+            windows_before = self.cycle.windows
+            window_rows_before = len(self.cycle.window_s)
             try:
                 tokens, self.cycle = continue_drafted(
                     self.runner, ids, max_new, cycle=self.cycle, start=self.cursor,
@@ -213,6 +216,9 @@ class Session:
                 rejected = self.cycle.rejected - rejected_before if self.cycle is not None else 0
                 produced = list(cancelled.produced)
                 prefill_s = getattr(self.cycle, "host_prefill_s", None) if self.cycle is not None else None
+                windows = self.cycle.windows - windows_before if self.cycle is not None else 0
+                phase = [after - before for after, before in zip(self.cycle.phase_s, phase_before)]
+                window_s = self.cycle.window_s[window_rows_before:]
                 self.cancel()
                 return {
                     "status": "cancelled",
@@ -222,6 +228,9 @@ class Session:
                     "accepted": accepted,
                     "rejected": rejected,
                     "host_prefill_s": prefill_s,
+                    "windows": windows,
+                    "phase_s": phase,
+                    "window_s": window_s,
                 }
             if self.cycle.cache_len != len(ids) + len(self.cycle.tokens) - 1:
                 raise RuntimeError("drafted cache diverged from the emitted tokens")
@@ -238,6 +247,9 @@ class Session:
                 "accepted": accepted,
                 "rejected": rejected,
                 "host_prefill_s": getattr(self.cycle, "host_prefill_s", None),
+                "windows": self.cycle.windows - windows_before,
+                "phase_s": [after - before for after, before in zip(self.cycle.phase_s, phase_before)],
+                "window_s": self.cycle.window_s[window_rows_before:],
             }
         except SessionBusy:
             raise

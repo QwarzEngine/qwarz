@@ -104,6 +104,12 @@ class DraftCycle:
         self.primed = 0
         self.accepted = 0
         self.rejected = 0
+        # Host-observed phase seconds per MTP window, accumulated per turn by
+        # the caller as deltas: draft (propose), verify (7-token forward),
+        # sample (target scoring), replay (rewind or replay forward + repair).
+        self.phase_s = [0.0, 0.0, 0.0, 0.0]
+        self.windows = 0
+        self.window_s = []
 
     def _model(self):
         if self.draft is None:
@@ -363,17 +369,21 @@ def continue_drafted(
     if sampling is not None:
         sampling = dict(sampling)
     suffix = SuffixIndex(prompt[:cache_len]) if NGRAM and single_pass and embed_ids is None else None
+    phases = cycle.phase_s
     while len(produced) < max_new:
         if _stop_requested(cancel):
             raise CancelledTurn(produced)
+        window_started = time.perf_counter()
         copied = suffix.propose(held, steps) if suffix is not None else None
         if copied is not None:
             drafted = copied
             cycle.proposals = [{token: 1.0} for token in drafted] if sampling is not None else None
         else:
             drafted = cycle.propose(held, steps, sampling=sampling) if sampling is not None else cycle.propose(held, steps)
+        verify_started = time.perf_counter()
         before = None if single_pass else runner.capture()
         _forward(runner, [held, *drafted], cache_len, embed_ids, inv_freq)
+        sample_started = time.perf_counter()
         proposals = getattr(cycle, "proposals", None)
         if verify is not None and proposals is not None:
             samples = _verify_sampled(runner, len(drafted) + 1, verify, drafted, proposals)
@@ -395,11 +405,18 @@ def continue_drafted(
                     matched = len(emitted) - 1
                     stopped = True
                     break
+        replay_started = time.perf_counter()
         if not emitted:
             if single_pass:
                 rewind(0)
             else:
                 runner.restore(before)
+            phases[0] += verify_started - window_started
+            phases[1] += sample_started - verify_started
+            phases[2] += replay_started - sample_started
+            phases[3] += time.perf_counter() - replay_started
+            cycle.windows += 1
+            cycle.window_s.append(time.perf_counter() - window_started)
             break
         body = [held, *emitted[:-1]]
         if single_pass:
@@ -421,6 +438,12 @@ def continue_drafted(
         produced.extend(emitted)
         held = emitted[-1]
         directive = on_accepted(produced) if on_accepted is not None else None
+        phases[0] += verify_started - window_started
+        phases[1] += sample_started - verify_started
+        phases[2] += replay_started - sample_started
+        phases[3] += time.perf_counter() - replay_started
+        cycle.windows += 1
+        cycle.window_s.append(time.perf_counter() - window_started)
         if _stop_requested(cancel):
             raise CancelledTurn(produced)
         if directive:

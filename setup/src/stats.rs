@@ -48,6 +48,12 @@ struct Turn {
     draft_acceptance: Option<f64>,
     cache_metrics_valid: bool,
     reasoning_tokens: Option<f64>,
+    windows: Option<f64>,
+    window_ms: Option<f64>,
+    draft_ms: Option<f64>,
+    verify_ms: Option<f64>,
+    sample_ms: Option<f64>,
+    replay_ms: Option<f64>,
 }
 
 struct Spread {
@@ -79,6 +85,10 @@ struct Summary {
     prompt_tokens: Spread,
     completion_tokens: Spread,
     reasoning_tokens: Spread,
+    window_ms: Spread,
+    windows: Spread,
+    phase_ms: [f64; 4],
+    phase_n: usize,
     by_prompt: Vec<Bucket>,
     min_completion: f64,
     min_prefill: f64,
@@ -215,6 +225,12 @@ fn turn_from_row(status: &str, result: &Value) -> Turn {
         draft_acceptance: number(&metrics["draft_acceptance"]),
         cache_metrics_valid: metrics["cache_metrics_valid"] == true,
         reasoning_tokens: number(&metrics["reasoning_tokens"]),
+        windows: number(&metrics["windows"]),
+        window_ms: number(&metrics["window_ms"]),
+        draft_ms: number(&metrics["draft_ms"]),
+        verify_ms: number(&metrics["verify_ms"]),
+        sample_ms: number(&metrics["sample_ms"]),
+        replay_ms: number(&metrics["replay_ms"]),
     }
 }
 
@@ -308,6 +324,21 @@ fn summarize(turns: &[Turn], min_completion: f64, min_prefill: f64) -> Summary {
         }
     }
     let drafted = accepted + rejected;
+    let window = turns.iter().filter_map(|turn| turn.window_ms).collect::<Vec<_>>();
+    let windows = turns.iter().filter_map(|turn| turn.windows).collect::<Vec<_>>();
+    let mut phase = [0.0; 4];
+    let mut phase_n = 0;
+    for turn in turns {
+        if let (Some(draft), Some(verify), Some(sample), Some(replay)) =
+            (turn.draft_ms, turn.verify_ms, turn.sample_ms, turn.replay_ms)
+        {
+            phase[0] += draft;
+            phase[1] += verify;
+            phase[2] += sample;
+            phase[3] += replay;
+            phase_n += 1;
+        }
+    }
     let mut names = BUCKETS.iter().map(|(_, name)| *name).collect::<Vec<_>>();
     names.push("256K+");
     let by_prompt = names.into_iter().filter_map(|name| {
@@ -342,6 +373,10 @@ fn summarize(turns: &[Turn], min_completion: f64, min_prefill: f64) -> Summary {
         prompt_tokens: spread(&turns.iter().filter_map(|turn| turn.prompt_tokens).collect::<Vec<_>>()),
         completion_tokens: spread(&turns.iter().filter_map(|turn| turn.completion_tokens).collect::<Vec<_>>()),
         reasoning_tokens: spread(&turns.iter().filter_map(|turn| turn.reasoning_tokens).collect::<Vec<_>>()),
+        window_ms: spread(&window),
+        windows: spread(&windows),
+        phase_ms: phase,
+        phase_n,
         by_prompt,
         min_completion,
         min_prefill,
@@ -425,11 +460,26 @@ fn format_report(summary: &Summary, turns: &[Turn], last: usize, since_seconds: 
         line("ttft", format!("{} median  n={}  min {}  max {}", fmt_ms(summary.ttft_ms.median), summary.ttft_ms.n, fmt_ms(summary.ttft_ms.min), fmt_ms(summary.ttft_ms.max))),
         line("first content", format!("{} median  n={}", fmt_ms(summary.first_content_ms.median), summary.first_content_ms.n)),
         line("prefill", format!("{} median  n={}  (new prompt tokens ≥ {})", fmt_tok_s(summary.prefill_tok_s.median), summary.prefill_tok_s.n, grouped(summary.min_prefill, 0))),
+        line("window", format!("{} median  n={}  min {}  max {}  ({} windows/turn median)", fmt_ms(summary.window_ms.median), summary.window_ms.n, fmt_ms(summary.window_ms.min), fmt_ms(summary.window_ms.max), grouped(summary.windows.median.unwrap_or(0.0), 1))),
         line("acceptance", format!("{} weighted  n={}  median {}  {} accepted / {} drafted", fmt_ratio(summary.acceptance_weighted), summary.acceptance_n, fmt_ratio(summary.acceptance_median), fmt_number(Some(summary.accepted_tokens)), fmt_number(Some(summary.drafted_tokens)))),
         line("prompt", format!("{} median tokens", fmt_number(summary.prompt_tokens.median))),
         line("output", format!("{} median tokens", fmt_number(summary.completion_tokens.median))),
         line("reasoning", format!("{} median tokens", fmt_number(summary.reasoning_tokens.median))),
     ];
+    if summary.phase_n > 0 {
+        let total = summary.phase_ms.iter().sum::<f64>();
+        let share = |value: f64| {
+            if total > 0.0 {
+                format!("{:.0}%", value / total * 100.0)
+            } else {
+                "—".into()
+            }
+        };
+        lines.push(line("window phase", format!(
+            "draft {}  verify {}  sample {}  replay {}  (n={})",
+            share(summary.phase_ms[0]), share(summary.phase_ms[1]), share(summary.phase_ms[2]), share(summary.phase_ms[3]), summary.phase_n
+        )));
+    }
     if summary.by_prompt.len() > 1 {
         lines.push(String::new());
         lines.push("by prompt size".into());
@@ -442,9 +492,9 @@ fn format_report(summary: &Summary, turns: &[Turn], last: usize, since_seconds: 
         lines.push("No interactions match this window.".into());
     } else {
         lines.push(String::new());
-        lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}  status", "age", "prompt", "out", "decode", "ttft", "accept"));
+        lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  status", "age", "prompt", "out", "decode", "ttft", "accept", "window"));
         for turn in turns {
-            lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}  {}", fmt_age(turn.created, now), fmt_number(turn.prompt_tokens), fmt_number(turn.completion_tokens), fmt_tok_s(turn.decode_tok_s), fmt_ms(turn.ttft_ms), fmt_ratio(turn.draft_acceptance), turn.status));
+            lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  {}", fmt_age(turn.created, now), fmt_number(turn.prompt_tokens), fmt_number(turn.completion_tokens), fmt_tok_s(turn.decode_tok_s), fmt_ms(turn.ttft_ms), fmt_ratio(turn.draft_acceptance), fmt_ms(turn.window_ms), turn.status));
         }
     }
     lines.join("\n")
@@ -484,6 +534,15 @@ fn json_report(summary: &Summary, turns: &[Turn], options: &Options, since_secon
             "prompt_tokens": spread_json(&summary.prompt_tokens),
             "completion_tokens": spread_json(&summary.completion_tokens),
             "reasoning_tokens": spread_json(&summary.reasoning_tokens),
+            "window_ms": spread_json(&summary.window_ms),
+            "windows": spread_json(&summary.windows),
+            "window_phase_ms": {
+                "draft": summary.phase_ms[0],
+                "verify": summary.phase_ms[1],
+                "sample": summary.phase_ms[2],
+                "replay": summary.phase_ms[3],
+                "n": summary.phase_n,
+            },
             "by_prompt": summary.by_prompt.iter().map(|bucket| json!({
                 "bucket": bucket.name,
                 "n": bucket.n,
@@ -503,6 +562,8 @@ fn json_report(summary: &Summary, turns: &[Turn], options: &Options, since_secon
             "decode_tok_s": turn.decode_tok_s,
             "draft_acceptance": turn.draft_acceptance,
             "cache_metrics_valid": turn.cache_metrics_valid,
+            "windows": turn.windows,
+            "window_ms": turn.window_ms,
         })).collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
@@ -666,6 +727,72 @@ mod tests {
         assert!(text.contains("<4K"), "{text}");
         assert!(text.contains("128K–256K"), "{text}");
         assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn window_row(created: f64, prompt: f64, completion: f64, windows: f64, window_ms: f64, draft: f64, verify: f64, sample: f64, replay: f64) -> (String, Value) {
+        (
+            "completed".into(),
+            json!({
+                "chat": {
+                    "created": created,
+                    "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
+                    "qwasar_metrics": {
+                        "ttft_ms": 100.0,
+                        "decode_tokens_per_second": 200.0,
+                        "cache_metrics_valid": true,
+                        "windows": windows,
+                        "window_ms": window_ms,
+                        "draft_ms": draft,
+                        "verify_ms": verify,
+                        "sample_ms": sample,
+                        "replay_ms": replay,
+                    }
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn window_phases_are_reported_when_the_engine_reports_them() {
+        let path = std::env::temp_dir().join(format!("qwarz-stats-phases-{}-{}.db", std::process::id(), NOW as u64));
+        let _ = std::fs::remove_file(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("CREATE TABLE responses(status TEXT, result TEXT)", []).unwrap();
+        for (status, result) in [
+            window_row(NOW - 100.0, 4_000.0, 60.0, 30.0, 20.0, 2.0, 10.0, 4.0, 4.0),
+            window_row(NOW - 50.0, 8_000.0, 40.0, 20.0, 20.0, 2.0, 10.0, 4.0, 4.0),
+            row(NOW - 5.0, 2_000.0, 20.0, 150.0, 300.0, 1_000.0, 200.0, 10.0, 10.0, "completed", true),
+        ] {
+            connection.execute("INSERT INTO responses(status, result) VALUES(?1, ?2)", rusqlite::params![status, result.to_string()]).unwrap();
+        }
+        drop(connection);
+        let mut options = Options {
+            last: 10,
+            since: None,
+            status: "completed,incomplete".into(),
+            min_completion: 1.0,
+            min_prompt: None,
+            max_prompt: None,
+            min_prefill: 256.0,
+            json: false,
+            database: None,
+        };
+        let text = render(&path, &options, Some(NOW)).unwrap();
+        assert!(text.contains("window phase"), "{text}");
+        assert!(text.contains("20 ms"), "{text}");
+        assert!(text.contains("draft 10%"), "{text}");
+        assert!(text.contains("verify 50%"), "{text}");
+        assert!(text.contains("sample 20%"), "{text}");
+        assert!(text.contains("replay 20%"), "{text}");
+        assert!(text.contains("25.0 windows/turn median"), "{text}");
+        options.json = true;
+        let payload: Value = serde_json::from_str(&render(&path, &options, Some(NOW)).unwrap()).unwrap();
+        assert_eq!(payload["summary"]["window_ms"]["median"], 20.0);
+        assert_eq!(payload["summary"]["window_phase_ms"]["n"], 2);
+        assert_eq!(payload["summary"]["window_phase_ms"]["verify"], 20.0);
+        // Newest first: the row without window fields is turns[0].
+        assert_eq!(payload["turns"][0]["window_ms"], Value::Null);
         let _ = std::fs::remove_file(path);
     }
 

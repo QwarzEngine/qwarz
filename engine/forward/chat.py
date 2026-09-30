@@ -8,6 +8,7 @@ dynamic ids. Raw ``ids`` requests never come through this module.
 """
 from __future__ import annotations
 
+import statistics
 import time
 
 import os
@@ -361,6 +362,10 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
     rejected = int(result.get("rejected") or 0)
     cached = result.get("cached_tokens")
     valid = status != "cancelled"
+    prefill_s = result.get("host_prefill_s")
+    windows = int(result.get("windows") or 0)
+    phase = result.get("phase_s") or [0.0, 0.0, 0.0, 0.0]
+    window_s = result.get("window_s") or []
     prompt = len(prepared["tokens"])
     first = state["first"]
     last = state["last"]
@@ -384,7 +389,13 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
         "accepted_draft_tokens": accepted if valid else None,
         "rejected_draft_tokens": rejected if valid else None,
         "draft_acceptance": accepted / (accepted + rejected) if valid and accepted + rejected else None,
-        "host_prefill_ms": None,
+        "host_prefill_ms": prefill_s * 1000 if prefill_s is not None else None,
+        "windows": windows if valid and windows else None,
+        "window_ms": statistics.median(window_s) * 1000 if valid and window_s else None,
+        "draft_ms": phase[0] * 1000 if valid and windows else None,
+        "verify_ms": phase[1] * 1000 if valid and windows else None,
+        "sample_ms": phase[2] * 1000 if valid and windows else None,
+        "replay_ms": phase[3] * 1000 if valid and windows else None,
         "finish_reason": finish,
         "reasoning_closed": state["close_reason"],
         "reasoning_tokens": state["reasoning_tokens"],

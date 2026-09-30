@@ -414,6 +414,39 @@ def test_a_stop_token_ends_the_window_before_the_rest_is_repaired():
     assert cycle.draft.position == 6
 
 
+def test_windows_record_their_phase_times():
+    from engine.forward.cycle import continue_drafted
+
+    session = _scripted_session([10, 11, 12, 13, 14, 15, 77])
+    tokens, cycle = continue_drafted(
+        session.runner, [1, 2, 3, 4], 7, cycle=session.cycle, stop_ids={12},
+    )
+    assert tokens == [10, 11, 12]
+    assert cycle.windows == 1
+    assert len(cycle.window_s) == 1
+    assert all(delta >= 0.0 for delta in cycle.phase_s)
+    assert abs(sum(cycle.phase_s) - cycle.window_s[0]) < 0.05
+
+
+def test_generate_reports_the_turn_window_delta():
+    session = _scripted_session([10, 11, 99, 13, 14, 15, 50])
+    first = session.generate([1, 2, 3, 4], 3)
+    assert first["status"] == "completed"
+    assert first["windows"] == 1
+    assert len(first["window_s"]) == 1
+    assert all(delta >= 0.0 for delta in first["phase_s"])
+    assert abs(sum(first["phase_s"]) - first["window_s"][0]) < 0.05
+    assert first["host_prefill_s"] is None
+    # The continuation shares the whole tape, so it reuses the cycle and the
+    # reported delta is only this turn's windows.
+    second = session.generate([1, 2, 3, 4, 10, 11, 99, 8, 8, 8], 3)
+    assert second["status"] == "completed"
+    assert second["windows"] == 3
+    assert len(second["window_s"]) == 3
+    assert abs(sum(second["phase_s"]) - sum(second["window_s"])) < 0.05
+    assert session.cycle.windows == first["windows"] + second["windows"]
+
+
 def test_chat_without_ids_returns_text_and_keeps_the_prefix():
     import json
 
@@ -441,6 +474,35 @@ def test_chat_without_ids_returns_text_and_keeps_the_prefix():
     assert done[-1]["snapshot"]["version"] == 1
     assert "xhigh" in done[-1]["snapshot"]["header"]
     assert session.cursor == len(done[-1]["snapshot"]["tape"])
+
+
+def test_chat_metrics_carry_the_measured_window_phases():
+    import json
+
+    from qwasar_runtime.engine import FakeTokenizer
+
+    class _Talk(FakeTokenizer):
+        def decode_ids(self, ids):
+            return "".join(chr(token) for token in ids if token < 128)
+
+    end = _Talk.special["<|im_end|>"]
+    session = _scripted_session([end, 0, 0, 0, 0, 0, 0])
+    worker = Worker(session, _Talk())
+    done = worker.push(json.dumps({
+        "op": "generate", "id": "resp_phases",
+        "request": {"messages": [{"role": "user", "content": "hi"}], "thinking": "off", "max_tokens": 8},
+    }))
+    metrics = done[-1]["metrics"]
+    # Two windows: the first ends in the stop token and injects the reasoning
+    # close, the second emits the stop again and ends the turn.
+    assert metrics["windows"] == 2
+    assert metrics["window_ms"] is not None
+    for phase in ("draft_ms", "verify_ms", "sample_ms", "replay_ms"):
+        assert metrics[phase] is not None
+        assert metrics[phase] >= 0.0
+    # The phase totals cover every window, so they reach at least the median.
+    assert sum(metrics[phase] for phase in ("draft_ms", "verify_ms", "sample_ms", "replay_ms")) >= metrics["window_ms"]
+    assert metrics["host_prefill_ms"] is None
     cursor = session.cursor
     follow_messages = done[-1]["snapshot"]["messages"] + [{"role": "user", "content": "next"}]
     follow = worker.push(json.dumps({

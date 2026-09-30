@@ -22,8 +22,8 @@ commands:
   status              service status
   logs                follow the service logs
   stop                stop the service
-  stats               tok/s, TTFT, prefill and acceptance over the newest
-                      stored interactions
+  stats               tok/s, TTFT, prefill, MTP window phases and
+                      acceptance over the newest stored interactions
                       --last N (default 20)
                       --since 30m|2h|1d
                       --status completed,incomplete|all
