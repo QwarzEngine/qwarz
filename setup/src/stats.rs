@@ -54,6 +54,8 @@ struct Turn {
     verify_ms: Option<f64>,
     sample_ms: Option<f64>,
     replay_ms: Option<f64>,
+    prefix_source: Option<String>,
+    cached_tokens: Option<f64>,
 }
 
 struct Spread {
@@ -89,6 +91,9 @@ struct Summary {
     windows: Spread,
     phase_ms: [f64; 4],
     phase_n: usize,
+    prefix_counts: [usize; 4],
+    restored_tokens: Spread,
+    prefilled_tokens: Spread,
     by_prompt: Vec<Bucket>,
     min_completion: f64,
     min_prefill: f64,
@@ -231,7 +236,20 @@ fn turn_from_row(status: &str, result: &Value) -> Turn {
         verify_ms: number(&metrics["verify_ms"]),
         sample_ms: number(&metrics["sample_ms"]),
         replay_ms: number(&metrics["replay_ms"]),
+        prefix_source: prefix_source(&metrics["prefix_source"]),
+        cached_tokens: number(&metrics["cached_tokens"]),
     }
+}
+
+const PREFIX_NAMES: [&str; 4] = ["zero", "tape", "commit", "mark"];
+
+fn prefix_source(value: &Value) -> Option<String> {
+    let source = value.as_str()?;
+    PREFIX_NAMES.contains(&source).then(|| source.to_string())
+}
+
+fn prefix_index(source: &str) -> Option<usize> {
+    PREFIX_NAMES.iter().position(|name| *name == source)
 }
 
 fn select_turns(rows: &[(String, Value)], last: usize, since_seconds: Option<f64>, statuses: Option<&[String]>, min_prompt: Option<f64>, max_prompt: Option<f64>, now: f64) -> Result<(Vec<Turn>, usize), String> {
@@ -339,6 +357,14 @@ fn summarize(turns: &[Turn], min_completion: f64, min_prefill: f64) -> Summary {
             phase_n += 1;
         }
     }
+    let mut prefix_counts = [0; 4];
+    for turn in turns {
+        if let Some(index) = turn.prefix_source.as_deref().and_then(prefix_index) {
+            prefix_counts[index] += 1;
+        }
+    }
+    let restored = turns.iter().filter_map(|turn| turn.cached_tokens).collect::<Vec<_>>();
+    let prefilled = turns.iter().filter_map(|turn| turn.physical_prefill_tokens).collect::<Vec<_>>();
     let mut names = BUCKETS.iter().map(|(_, name)| *name).collect::<Vec<_>>();
     names.push("256K+");
     let by_prompt = names.into_iter().filter_map(|name| {
@@ -377,6 +403,9 @@ fn summarize(turns: &[Turn], min_completion: f64, min_prefill: f64) -> Summary {
         windows: spread(&windows),
         phase_ms: phase,
         phase_n,
+        prefix_counts,
+        restored_tokens: spread(&restored),
+        prefilled_tokens: spread(&prefilled),
         by_prompt,
         min_completion,
         min_prefill,
@@ -480,6 +509,13 @@ fn format_report(summary: &Summary, turns: &[Turn], last: usize, since_seconds: 
             share(summary.phase_ms[0]), share(summary.phase_ms[1]), share(summary.phase_ms[2]), share(summary.phase_ms[3]), summary.phase_n
         )));
     }
+    if summary.prefix_counts.iter().sum::<usize>() > 0 || summary.restored_tokens.n > 0 {
+        let counts = PREFIX_NAMES.iter().zip(summary.prefix_counts).map(|(name, count)| format!("{name} {count}")).collect::<Vec<_>>().join("  ");
+        lines.push(line("prefix", format!(
+            "{counts}    restored {} median  new {} median",
+            fmt_number(summary.restored_tokens.median), fmt_number(summary.prefilled_tokens.median)
+        )));
+    }
     if summary.by_prompt.len() > 1 {
         lines.push(String::new());
         lines.push("by prompt size".into());
@@ -492,9 +528,9 @@ fn format_report(summary: &Summary, turns: &[Turn], last: usize, since_seconds: 
         lines.push("No interactions match this window.".into());
     } else {
         lines.push(String::new());
-        lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  status", "age", "prompt", "out", "decode", "ttft", "accept", "window"));
+        lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  {:<6}  status", "age", "prompt", "out", "decode", "ttft", "accept", "window", "prefix"));
         for turn in turns {
-            lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  {}", fmt_age(turn.created, now), fmt_number(turn.prompt_tokens), fmt_number(turn.completion_tokens), fmt_tok_s(turn.decode_tok_s), fmt_ms(turn.ttft_ms), fmt_ratio(turn.draft_acceptance), fmt_ms(turn.window_ms), turn.status));
+            lines.push(format!("{:<6}{:>10}{:>8}{:>12}{:>10}{:>8}{:>8}  {:<6}  {}", fmt_age(turn.created, now), fmt_number(turn.prompt_tokens), fmt_number(turn.completion_tokens), fmt_tok_s(turn.decode_tok_s), fmt_ms(turn.ttft_ms), fmt_ratio(turn.draft_acceptance), fmt_ms(turn.window_ms), turn.prefix_source.as_deref().unwrap_or("—"), turn.status));
         }
     }
     lines.join("\n")
@@ -543,6 +579,14 @@ fn json_report(summary: &Summary, turns: &[Turn], options: &Options, since_secon
                 "replay": summary.phase_ms[3],
                 "n": summary.phase_n,
             },
+            "prefix": {
+                "zero": summary.prefix_counts[0],
+                "tape": summary.prefix_counts[1],
+                "commit": summary.prefix_counts[2],
+                "mark": summary.prefix_counts[3],
+                "restored_tokens": spread_json(&summary.restored_tokens),
+                "prefilled_tokens": spread_json(&summary.prefilled_tokens),
+            },
             "by_prompt": summary.by_prompt.iter().map(|bucket| json!({
                 "bucket": bucket.name,
                 "n": bucket.n,
@@ -564,6 +608,9 @@ fn json_report(summary: &Summary, turns: &[Turn], options: &Options, since_secon
             "cache_metrics_valid": turn.cache_metrics_valid,
             "windows": turn.windows,
             "window_ms": turn.window_ms,
+            "prefix_source": turn.prefix_source,
+            "cached_tokens": turn.cached_tokens,
+            "physical_prefill_tokens": turn.physical_prefill_tokens,
         })).collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
@@ -593,6 +640,47 @@ fn load_results(database: &Path, limit: usize) -> Result<Vec<(String, Value)>, S
         }
     }
     Ok(loaded)
+}
+
+/// A stored turn the monitor can align with a hardware sample.
+///
+/// `created` is the completion time in whole seconds. The turn occupies
+/// `[created - elapsed_s, created + 1)`.
+pub(crate) struct StoredTurn {
+    pub created: f64,
+    pub elapsed_s: f64,
+    pub prompt_tokens: Option<f64>,
+    pub completion_tokens: Option<f64>,
+    pub decode_tok_s: Option<f64>,
+    pub prefix_source: Option<String>,
+    pub cached_tokens: Option<f64>,
+    pub physical_prefill_tokens: Option<f64>,
+}
+
+pub(crate) fn stored_turns(database: &Path, limit: usize) -> Result<Vec<StoredTurn>, String> {
+    let mut turns = Vec::new();
+    for (_status, result) in load_results(database, limit)? {
+        let chat = object(&result, "chat");
+        let metrics = object(chat, "qwasar_metrics");
+        let usage = object(chat, "usage");
+        let (Some(created), Some(elapsed_ms)) = (number(&chat["created"]), number(&metrics["elapsed_ms"])) else {
+            continue;
+        };
+        if elapsed_ms < 0.0 {
+            continue;
+        }
+        turns.push(StoredTurn {
+            created,
+            elapsed_s: elapsed_ms / 1000.0,
+            prompt_tokens: number(&usage["prompt_tokens"]),
+            completion_tokens: number(&usage["completion_tokens"]),
+            decode_tok_s: number(&metrics["decode_tokens_per_second"]),
+            prefix_source: prefix_source(&metrics["prefix_source"]),
+            cached_tokens: number(&metrics["cached_tokens"]),
+            physical_prefill_tokens: number(&metrics["physical_prefill_tokens"]),
+        });
+    }
+    Ok(turns)
 }
 
 fn render(database: &Path, options: &Options, now: Option<f64>) -> Result<String, SetupError> {
@@ -751,6 +839,24 @@ mod tests {
                 }
             }),
         )
+    }
+
+    #[test]
+    fn prefix_reuse_is_counted_apart_from_a_cold_prefill() {
+        let cold = turn_from_row("completed", &json!({"chat": {"created": NOW, "usage": {"prompt_tokens": 1000.0, "completion_tokens": 20.0}, "qwasar_metrics": {"cached_tokens": 0.0, "physical_prefill_tokens": 999.0, "prefix_source": "zero", "cache_metrics_valid": true}}}));
+        let reused = turn_from_row("completed", &json!({"chat": {"created": NOW - 5.0, "usage": {"prompt_tokens": 9000.0, "completion_tokens": 40.0}, "qwasar_metrics": {"cached_tokens": 8000.0, "physical_prefill_tokens": 200.0, "prefix_source": "tape", "cache_metrics_valid": true}}}));
+        let marked = turn_from_row("completed", &json!({"chat": {"created": NOW - 9.0, "usage": {"prompt_tokens": 5000.0, "completion_tokens": 10.0}, "qwasar_metrics": {"cached_tokens": 256.0, "physical_prefill_tokens": 4000.0, "prefix_source": "mark", "cache_metrics_valid": true}}}));
+        let summary = summarize(&[cold.clone(), reused.clone(), marked.clone()], 1.0, 256.0);
+        assert_eq!(summary.prefix_counts, [1, 1, 0, 1]);
+        assert_eq!(summary.restored_tokens.median, Some(256.0));
+        assert_eq!(summary.prefilled_tokens.median, Some(999.0));
+        let text = format_report(&summary, &[cold, reused, marked], 3, None, Some(&["completed".into()]), 3, false, NOW);
+        assert!(text.contains("zero 1"), "{text}");
+        assert!(text.contains("tape 1"), "{text}");
+        assert!(text.contains("mark 1"), "{text}");
+        assert!(text.contains("commit 0"), "{text}");
+        assert!(text.contains("restored 256 median"), "{text}");
+        assert!(text.contains("new 999 median"), "{text}");
     }
 
     #[test]

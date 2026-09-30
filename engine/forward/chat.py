@@ -396,6 +396,7 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
         "verify_ms": phase[1] * 1000 if valid and windows else None,
         "sample_ms": phase[2] * 1000 if valid and windows else None,
         "replay_ms": phase[3] * 1000 if valid and windows else None,
+        "prefix_source": result.get("prefix_source") if valid else None,
         "finish_reason": finish,
         "reasoning_closed": state["close_reason"],
         "reasoning_tokens": state["reasoning_tokens"],

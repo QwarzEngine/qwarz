@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const GPU_QUERY: &[&str] = &[
     "index", "uuid", "name", "utilization.gpu", "utilization.memory", "memory.used", "memory.total",
@@ -112,6 +112,7 @@ pub fn execute(arguments: impl Iterator<Item = String>) -> Result<(), SetupError
         unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t); }
     }
     let mut taken = Vec::new();
+    let mut readings = Vec::new();
     let mut health = None;
     let mut previous: Option<Vec<f64>> = None;
     loop {
@@ -121,6 +122,13 @@ pub fn execute(arguments: impl Iterator<Item = String>) -> Result<(), SetupError
         let (sample, health_now, counters) = capture(options.gpu, previous.as_deref(), previous.is_none())?;
         health = health_now;
         previous = Some(counters);
+        readings.push(Reading {
+            at: unix_now(),
+            busy: worker_busy(health.as_ref()),
+            gpu: sample.gpu.utilization_gpu,
+            bandwidth: sample.gpu.utilization_memory,
+            power: sample.gpu.power_w,
+        });
         if !options.json {
             if !taken.is_empty() {
                 println!();
@@ -138,17 +146,43 @@ pub fn execute(arguments: impl Iterator<Item = String>) -> Result<(), SetupError
     if taken.is_empty() {
         return Ok(());
     }
+    let stored = crate::setup::discover_repo()
+        .ok()
+        .map(|repo| repo.join("state/qwasar.db"))
+        .filter(|path| path.is_file())
+        .and_then(|path| stats::stored_turns(&path, 200).ok())
+        .unwrap_or_default();
+    let blocks = activity_blocks(&readings, &stored);
     let summary = (taken.len() > 1).then(|| summarize(&taken));
     if options.json && samples.is_some() {
         println!("{}", serde_json::to_string_pretty(&json!({
             "samples": taken.iter().map(sample_json).collect::<Vec<_>>(),
             "summary": summary.as_ref().map(summary_json),
             "worker": worker_label(health.as_ref()),
+            "activity": activity_json(&blocks),
         })).unwrap_or_else(|_| "{}".into()));
-    } else if let Some(summary) = summary.filter(|_| !options.json) {
-        println!("{}", format_summary(&summary));
+    } else if options.json {
+        if let Some(value) = activity_json(&blocks) {
+            println!("{}", serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()));
+        }
+    } else {
+        if let Some(summary) = summary {
+            println!("{}", format_summary(&summary));
+        }
+        let activity = format_activity(&blocks);
+        if !activity.is_empty() {
+            println!("\n{activity}");
+        }
     }
     Ok(())
+}
+
+fn unix_now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|duration| duration.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn worker_busy(health: Option<&Value>) -> bool {
+    health.and_then(|value| value.get("worker")).and_then(|worker| worker.get("busy")).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Options, SetupError> {
@@ -546,6 +580,183 @@ fn capture(gpu: Option<u32>, previous: Option<&[f64]>, initial_wait: bool) -> Re
     Ok((sample, health, current))
 }
 
+struct Reading {
+    at: f64,
+    busy: bool,
+    gpu: Option<f64>,
+    bandwidth: Option<f64>,
+    power: Option<f64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Turn,
+    Inflight,
+    Idle,
+}
+
+struct Block {
+    kind: BlockKind,
+    turn_index: Option<usize>,
+    samples: usize,
+    gpu: Vec<f64>,
+    bandwidth: Vec<f64>,
+    power: Vec<f64>,
+    prompt_tokens: Option<f64>,
+    completion_tokens: Option<f64>,
+    decode_tok_s: Option<f64>,
+    prefix_source: Option<String>,
+    cached_tokens: Option<f64>,
+    physical_prefill_tokens: Option<f64>,
+}
+
+fn matching_turn(at: f64, turns: &[stats::StoredTurn]) -> Option<usize> {
+    let mut best_index = None;
+    let mut best_distance = f64::MAX;
+    for (index, turn) in turns.iter().enumerate() {
+        let start = turn.created - turn.elapsed_s;
+        let end = turn.created + 1.0;
+        if at >= start && at < end {
+            let distance = (turn.created - at).abs();
+            if distance < best_distance {
+                best_distance = distance;
+                best_index = Some(index);
+            }
+        }
+    }
+    best_index
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampleKey {
+    Turn(usize),
+    Inflight,
+    Idle,
+}
+
+fn sample_key(reading: &Reading, turns: &[stats::StoredTurn]) -> SampleKey {
+    if let Some(index) = matching_turn(reading.at, turns) {
+        SampleKey::Turn(index)
+    } else if reading.busy {
+        SampleKey::Inflight
+    } else {
+        SampleKey::Idle
+    }
+}
+
+fn activity_blocks(readings: &[Reading], turns: &[stats::StoredTurn]) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    for reading in readings {
+        let key = sample_key(reading, turns);
+        let continues = match (blocks.last(), key) {
+            (Some(block), SampleKey::Turn(index)) if block.turn_index == Some(index) => true,
+            (Some(block), SampleKey::Inflight) if block.kind == BlockKind::Inflight => true,
+            (Some(block), SampleKey::Idle) if block.kind == BlockKind::Idle => true,
+            _ => false,
+        };
+        if !continues {
+            let (kind, index) = match key {
+                SampleKey::Turn(index) => (BlockKind::Turn, Some(index)),
+                SampleKey::Inflight => (BlockKind::Inflight, None),
+                SampleKey::Idle => (BlockKind::Idle, None),
+            };
+            let turn = index.and_then(|index| turns.get(index));
+            blocks.push(Block {
+                kind,
+                turn_index: index,
+                samples: 0,
+                gpu: Vec::new(),
+                bandwidth: Vec::new(),
+                power: Vec::new(),
+                prompt_tokens: turn.and_then(|item| item.prompt_tokens),
+                completion_tokens: turn.and_then(|item| item.completion_tokens),
+                decode_tok_s: turn.and_then(|item| item.decode_tok_s),
+                prefix_source: turn.and_then(|item| item.prefix_source.clone()),
+                cached_tokens: turn.and_then(|item| item.cached_tokens),
+                physical_prefill_tokens: turn.and_then(|item| item.physical_prefill_tokens),
+            });
+        }
+        let block = blocks.last_mut().expect("a block was just ensured");
+        block.samples += 1;
+        if let Some(value) = reading.gpu {
+            block.gpu.push(value);
+        }
+        if let Some(value) = reading.bandwidth {
+            block.bandwidth.push(value);
+        }
+        if let Some(value) = reading.power {
+            block.power.push(value);
+        }
+    }
+    blocks
+}
+
+fn amount(value: Option<f64>) -> String {
+    value.map(|item| stats::grouped(item, 0)).unwrap_or_else(|| "—".into())
+}
+
+fn format_activity(blocks: &[Block]) -> String {
+    if !blocks.iter().any(|block| block.kind != BlockKind::Idle) {
+        return String::new();
+    }
+    let mut lines = vec!["request".into()];
+    for block in blocks {
+        let heading = match block.kind {
+            BlockKind::Turn => "while generating",
+            BlockKind::Inflight => "in flight",
+            BlockKind::Idle => "while idle",
+        };
+        lines.push(heading.into());
+        if block.kind == BlockKind::Turn {
+            lines.push(format!(
+                "  prompt {}  out {}  decode {}  prefix {}  restored {}  new {}",
+                amount(block.prompt_tokens),
+                amount(block.completion_tokens),
+                block.decode_tok_s.map(|rate| format!("{} tok/s", stats::grouped(rate, 0))).unwrap_or_else(|| "—".into()),
+                block.prefix_source.as_deref().unwrap_or("—"),
+                amount(block.cached_tokens),
+                amount(block.physical_prefill_tokens),
+            ));
+        }
+        let noun = if block.samples == 1 { "sample" } else { "samples" };
+        lines.push(format!(
+            "  {} {noun}   GPU {}   memory bandwidth {}   power {}",
+            block.samples,
+            fmt_percent(stats::median(&block.gpu)),
+            fmt_percent(stats::median(&block.bandwidth)),
+            fmt_watts(stats::median(&block.power)),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn activity_json(blocks: &[Block]) -> Option<Value> {
+    if !blocks.iter().any(|block| block.kind != BlockKind::Idle) {
+        return None;
+    }
+    let spread = |values: &[f64]| json!({"n": values.len(), "median": stats::median(values), "min": values.iter().copied().reduce(f64::min), "max": values.iter().copied().reduce(f64::max)});
+    Some(Value::Array(blocks.iter().map(|block| {
+        let kind = match block.kind {
+            BlockKind::Turn => "turn",
+            BlockKind::Inflight => "in_flight",
+            BlockKind::Idle => "idle",
+        };
+        json!({
+            "kind": kind,
+            "samples": block.samples,
+            "prompt_tokens": block.prompt_tokens,
+            "completion_tokens": block.completion_tokens,
+            "decode_tok_s": block.decode_tok_s,
+            "prefix_source": block.prefix_source,
+            "cached_tokens": block.cached_tokens,
+            "physical_prefill_tokens": block.physical_prefill_tokens,
+            "utilization_gpu": spread(&block.gpu),
+            "utilization_memory": spread(&block.bandwidth),
+            "power_w": spread(&block.power),
+        })
+    }).collect()))
+}
+
 fn sample_json(sample: &Sample) -> Value {
     json!({
         "gpu": {
@@ -655,5 +866,39 @@ mod tests {
         assert!(text.contains("over 2 samples"));
         assert!(text.contains("min 37"));
         assert!(text.contains("max 80"));
+    }
+
+    fn reading(at: f64, busy: bool, gpu: f64) -> Reading {
+        Reading { at, busy, gpu: Some(gpu), bandwidth: Some(gpu / 2.0), power: Some(gpu * 5.0) }
+    }
+
+    #[test]
+    fn samples_inside_a_stored_turn_are_separated_from_idle_and_in_flight() {
+        let turns = vec![stats::StoredTurn {
+            created: 1_000.0,
+            elapsed_s: 10.0,
+            prompt_tokens: Some(4_000.0),
+            completion_tokens: Some(80.0),
+            decode_tok_s: Some(140.0),
+            prefix_source: Some("tape".into()),
+            cached_tokens: Some(3_000.0),
+            physical_prefill_tokens: Some(1_000.0),
+        }];
+        // The stored completion second makes the turn occupy [990, 1001).
+        let readings = vec![
+            reading(980.0, true, 90.0),
+            reading(992.0, true, 80.0),
+            reading(998.0, true, 60.0),
+            reading(1_001.5, false, 4.0),
+        ];
+        let text = format_activity(&activity_blocks(&readings, &turns));
+        assert!(text.contains("in flight"), "{text}");
+        assert!(text.contains("while generating"), "{text}");
+        assert!(text.contains("prefix tape"), "{text}");
+        assert!(text.contains("restored 3,000"), "{text}");
+        assert!(text.contains("new 1,000"), "{text}");
+        assert!(text.contains("GPU 70%"), "{text}");
+        assert!(text.contains("while idle"), "{text}");
+        assert!(format_activity(&activity_blocks(&[reading(1_010.0, false, 1.0)], &turns)).is_empty());
     }
 }

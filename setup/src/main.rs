@@ -22,8 +22,8 @@ commands:
   status              service status
   logs                follow the service logs
   stop                stop the service
-  stats               tok/s, TTFT, prefill, MTP window phases and
-                      acceptance over the newest stored interactions
+  stats               tok/s, TTFT, prefill, MTP window phases, prefix
+                      reuse and acceptance over the newest stored interactions
                       --last N (default 20)
                       --since 30m|2h|1d
                       --status completed,incomplete|all
@@ -32,7 +32,8 @@ commands:
                       --min-prefill N (default 256, prefill sample)
                       --json  --database PATH
   monitor             GPU, power, temperature, CPU and memory for the machine
-                      running the worker
+                      running the worker. Samples taken while a stored turn
+                      was in flight are reported against that turn
                       --interval 1s   repeat until interrupted
                       --samples N     stop after N samples (default 1)
                       --gpu N         GPU index (default: the worker's GPU)

@@ -59,9 +59,14 @@ class Session:
         self._draft_mark = None
         self.marks = {}
         self._spare_draft = None
+        # Where the last generate got its prefix: "tape" (the resident tape
+        # already holds it), "commit" (restored the last commit), "mark"
+        # (restored a pinned prefix mark), or "zero" (cold prefill).
+        self.rewind_source = "zero"
 
     def _zero(self):
         """Forget the tape. The runner keeps its pages and graphs when it can."""
+        self.rewind_source = "zero"
         draft = self.cycle.draft if self.cycle is not None else None
         rezero = getattr(self.runner, "rezero", None)
         if callable(rezero) and getattr(self.runner, "states", None):
@@ -131,6 +136,7 @@ class Session:
 
     def _rewind_to_commit_or_zero(self, shared, limit=None):
         if shared >= self.cursor:
+            self.rewind_source = "tape" if self.cursor > 0 else "zero"
             return
         if self.snapshot is not None and shared >= self.committed:
             self.runner.restore(self.snapshot)
@@ -140,8 +146,10 @@ class Session:
                 self.cycle.draft is None or self.cycle.draft.position != self.cursor
             ):
                 self.cycle = None
+            self.rewind_source = "commit"
             return
         if self._restore_mark(shared if limit is None else min(shared, limit)):
+            self.rewind_source = "mark"
             return
         self._zero()
 
@@ -219,6 +227,7 @@ class Session:
                 windows = self.cycle.windows - windows_before if self.cycle is not None else 0
                 phase = [after - before for after, before in zip(self.cycle.phase_s, phase_before)]
                 window_s = self.cycle.window_s[window_rows_before:]
+                source = self.rewind_source
                 self.cancel()
                 return {
                     "status": "cancelled",
@@ -231,6 +240,7 @@ class Session:
                     "windows": windows,
                     "phase_s": phase,
                     "window_s": window_s,
+                    "prefix_source": source,
                 }
             if self.cycle.cache_len != len(ids) + len(self.cycle.tokens) - 1:
                 raise RuntimeError("drafted cache diverged from the emitted tokens")
@@ -250,6 +260,7 @@ class Session:
                 "windows": self.cycle.windows - windows_before,
                 "phase_s": [after - before for after, before in zip(self.cycle.phase_s, phase_before)],
                 "window_s": self.cycle.window_s[window_rows_before:],
+                "prefix_source": self.rewind_source,
             }
         except SessionBusy:
             raise

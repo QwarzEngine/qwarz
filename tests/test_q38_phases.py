@@ -476,6 +476,44 @@ def test_chat_without_ids_returns_text_and_keeps_the_prefix():
     assert session.cursor == len(done[-1]["snapshot"]["tape"])
 
 
+def test_prefix_source_reports_the_rewind_origin():
+    from engine.forward.cycle import DraftCycle
+
+    class _KeptDraft(_ScriptedDraft):
+        def reset(self):
+            self.position = 0
+            self._next = 10
+
+    class _MarkedRunner(_ScriptedRunner):
+        def __init__(self):
+            super().__init__([10, 11, 99, 13, 14, 15, 50])
+            self.draft = _KeptDraft()
+            self.states = {0: object()}
+
+        def capture_host(self, into=None):
+            return self.state
+
+        def rezero(self):
+            self.state = 0
+
+    runner = _MarkedRunner()
+    session = Session(runner)
+    session.cycle = DraftCycle(runner, draft=runner.draft)
+    cold = session.generate(list(range(300)), 2, cuts=[256])
+    assert cold["prefix_source"] == "zero"
+    assert session.marks
+    # A continuation shares the whole tape.
+    continuation = session.generate(list(range(300)) + [10, 11, 500, 501, 502], 2)
+    assert continuation["prefix_source"] == "tape"
+    # A divergent turn that shares only the pinned prefix restores the mark.
+    divergent = session.generate([*range(260), 900, 901, 902], 2)
+    assert divergent["prefix_source"] == "mark"
+    assert divergent["cached_tokens"] == 256
+    # A turn with no shared prefix prefills from zero.
+    fresh = session.generate([700, 701, 702, 703], 2)
+    assert fresh["prefix_source"] == "zero"
+
+
 def test_chat_metrics_carry_the_measured_window_phases():
     import json
 
@@ -496,6 +534,7 @@ def test_chat_metrics_carry_the_measured_window_phases():
     # Two windows: the first ends in the stop token and injects the reasoning
     # close, the second emits the stop again and ends the turn.
     assert metrics["windows"] == 2
+    assert metrics["prefix_source"] == "zero"
     assert metrics["window_ms"] is not None
     for phase in ("draft_ms", "verify_ms", "sample_ms", "replay_ms"):
         assert metrics[phase] is not None
