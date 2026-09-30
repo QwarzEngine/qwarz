@@ -150,6 +150,9 @@ def _capture_chunk(mixed_qkv, beta, g, recurrent):
     return core
 
 
+_STASH = 8
+
+
 def _remember_window(state, mixed, beta, g, conv, bias):
     """Keep the inputs of a short recurrent chunk so it can be cut later.
 
@@ -158,15 +161,17 @@ def _remember_window(state, mixed, beta, g, conv, bias):
     gigabyte. Prefill above eight tokens does not take this path.
     """
     length = mixed.shape[-1]
-    remembered = state._rewind_mixed
-    if remembered is None or remembered.shape[-1] != length:
-        state._rewind_mixed = mixed.clone()
-        state._rewind_beta = beta.clone()
-        state._rewind_g = g.clone()
-    else:
-        state._rewind_mixed.copy_(mixed)
-        state._rewind_beta.copy_(beta)
-        state._rewind_g.copy_(g)
+    # The stash is allocated once at the widest window and filled as a prefix.
+    # A verify graph records these addresses; reallocating for a two-token
+    # reasoning close left the graph writing freed memory and the rewind
+    # reading a stale buffer, which turned the recurrent state into NaN.
+    if state._rewind_mixed is None:
+        state._rewind_mixed = mixed.new_empty(mixed.shape[:-1] + (_STASH,))
+        state._rewind_beta = beta.new_empty((beta.shape[0], _STASH) + beta.shape[2:])
+        state._rewind_g = g.new_empty((g.shape[0], _STASH) + g.shape[2:])
+    state._rewind_mixed[..., :length].copy_(mixed)
+    state._rewind_beta[:, :length].copy_(beta)
+    state._rewind_g[:, :length].copy_(g)
     if state._rewind_conv is None:
         state._rewind_conv = state.conv.clone()
         state._rewind_recurrent = state.recurrent.clone()

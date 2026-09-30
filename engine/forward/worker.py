@@ -13,6 +13,7 @@ import queue
 import threading
 
 from engine.forward.gate import promotion_allowed
+from engine.forward.mtp import DRAFT_TOKENS
 from engine.forward.session import SessionBusy
 from engine.forward.vision import MM_TOKEN_BASE, canonical_tape
 
@@ -54,7 +55,7 @@ class Worker:
                 "engine": "q38",
                 "linked": False,
                 "draft_method": "mtp",
-                "draft_tokens": 6,
+                "draft_tokens": DRAFT_TOKENS,
                 "promotion_allowed": False,
             },
         }
@@ -402,14 +403,40 @@ def _load_tokenizer(model):
     return tokenizer
 
 
+def _warm(runner, vocab):
+    """Compile and capture the first-request paths before the worker says ready.
+
+    The first real turn paid ~3.6 s of kernel compilation, workspace setup and
+    graph capture on top of its prefill. A long cut (FP8 prefill), a short
+    suffix (Flash prefill), greedy and sampled MTP windows run here instead.
+    """
+    import torch
+
+    from engine.forward.embed import prompt_ids
+    from engine.forward.sample import chooser
+    from engine.forward.session import Session
+
+    ids = prompt_ids(torch, 8448 + 320).view(-1).tolist()
+    session = Session(runner)
+    session.generate(ids[:8448], 24)
+    session.generate(ids, 24, choose=chooser(1.0, 0.95, 1, top_k=20, vocab=vocab, speculative=True))
+    runner.rezero()
+    torch.cuda.synchronize()
+
+
 def _gpu_session(model, context):
+    import os
+
     from engine.forward.resident import ModelRunner
     from engine.forward.session import Session
 
     pages = max(1, context // 256)
     runner = ModelRunner(pages=pages, model_dir=model, retain=True)
     runner._ensure()
-    return Session(runner, context=context), _load_tokenizer(model)
+    tokenizer = _load_tokenizer(model)
+    if os.environ.get("QWARZ_WARMUP", "1") != "0":
+        _warm(runner, getattr(tokenizer, "actual_vocab_size", None))
+    return Session(runner, context=context), tokenizer
 
 
 def _serve(worker, incoming, outgoing):

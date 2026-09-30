@@ -5,15 +5,20 @@ allocated across turns, so a suffix forward starts at the committed cursor.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
 
 from engine.forward.embed import gather, load_weight
 from engine.forward.mlp import _runtime
+from engine.forward.mtp import DRAFT_TOKENS
 from engine.forward.schedule import PAGE
 from engine.forward.token import LAYERS, _proposer_head, apply_layer, load_spec, logits, rms
 from engine.forward.vision import MM_TOKEN_BASE
+
+
+REWIND_GRAPHS = os.environ.get("QWARZ_REWIND_GRAPH", "1") != "0"
 
 
 class ModelRunner:
@@ -30,6 +35,7 @@ class ModelRunner:
         self._table = None
         self._decode_graphs = {}
         self._prefill_graphs = {}
+        self._rewind_graphs = {}
         self._graph_pool = None
         self.last = None
         self.hidden = None
@@ -55,9 +61,10 @@ class ModelRunner:
         _proposer_head(self._model)
         self._decode_graphs = {}
         self._prefill_graphs = {}
+        self._rewind_graphs = {}
         self._graph_pool = torch.cuda.graph_pool_handle()
 
-    def _decode_bucket(self, cache_len, width=7):
+    def _decode_bucket(self, cache_len, width=DRAFT_TOKENS + 1):
         """Power-of-two page count that covers this verify, capped at the allocation."""
         used = (cache_len + width + PAGE - 1) // PAGE
         bucket = 1
@@ -72,7 +79,7 @@ class ModelRunner:
             embedded is None
             and inv_freq is None
             and isinstance(cache_len, int)
-            and len(token_ids) == 7
+            and len(token_ids) == DRAFT_TOKENS + 1
             and bool(self.states)
             and all(state.ready for state in self.states.values())
         )
@@ -269,21 +276,78 @@ class ModelRunner:
             for index, state in self.states.items()
         }
 
+    def capture_host(self, into=None):
+        """Copy every GDN state into pinned host memory on the current stream.
+
+        Attention pages are append-only, so a prefix needs only this recurrent
+        state (~151 MB). ``into`` reuses an evicted mark's buffers; the copy is
+        stream-ordered, so neither the capture nor a later restore syncs.
+        """
+        if into is None:
+            into = {
+                index: (
+                    torch.empty(state.conv.shape, dtype=state.conv.dtype, pin_memory=True),
+                    torch.empty(state.recurrent.shape, dtype=state.recurrent.dtype, pin_memory=True),
+                    True,
+                )
+                for index, state in self.states.items()
+            }
+        marked = {}
+        for index, state in self.states.items():
+            conv, recurrent, _ready = into[index]
+            conv.copy_(state.conv, non_blocking=True)
+            recurrent.copy_(state.recurrent, non_blocking=True)
+            marked[index] = (conv, recurrent, state.ready)
+        return marked
+
     def restore(self, snapshot):
         for index, (conv, recurrent, ready) in snapshot.items():
             state = self.states[index]
-            state.conv.copy_(conv)
-            state.recurrent.copy_(recurrent)
+            state.conv.copy_(conv, non_blocking=True)
+            state.recurrent.copy_(recurrent, non_blocking=True)
             state.ready = ready
             state._rewind_len = None
 
     def rewind_recurrent(self, keep):
-        """Cut every GDN state to the accepted prefix of the last short chunk."""
+        """Cut every GDN state to the accepted prefix of the last short chunk.
+
+        After a 7-token verify the cut is one graph per ``keep``: 48 layers of
+        restore and replay were ~1.5 ms of Python launches for ~0.3 ms of work.
+        Any other window length stays eager.
+        """
         from engine.forward.projections import rewind_gdn_state
 
         if not self.states:
             raise RuntimeError("no GDN state to rewind")
-        for state in self.states.values():
+        states = list(self.states.values())
+        width = states[0]._rewind_len
+        if (
+            REWIND_GRAPHS
+            and self._graph_pool is not None
+            and width == DRAFT_TOKENS + 1
+            and 0 <= keep < width
+            and all(state._rewind_len == width for state in states)
+        ):
+            slot = self._rewind_graphs.setdefault(keep, {"warm": 0, "graph": None})
+            if slot["graph"] is not None:
+                slot["graph"].replay()
+                for state in states:
+                    state._rewind_len = None
+                return
+            if slot["warm"] >= 2:
+                graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph, pool=self._graph_pool):
+                    for state in states:
+                        rewind_gdn_state(state, keep)
+                slot["graph"] = graph
+                # Capture records the launches and does not run them.
+                graph.replay()
+                for state in states:
+                    state._rewind_len = None
+                return
+            slot["warm"] += 1
+        for state in states:
             rewind_gdn_state(state, keep)
 
     def synchronize(self):
@@ -309,6 +373,11 @@ class ModelRunner:
         release_attention_plans()
         self._decode_graphs = {}
         self._prefill_graphs = {}
+        self._rewind_graphs = {}
+        # Dropping every graph releases its private pool. Capturing into the
+        # old handle afterwards trips the caching allocator's use_count assert.
+        if self._graph_pool is not None:
+            self._graph_pool = torch.cuda.graph_pool_handle()
         self.states.clear()
         self.caches.clear()
         self.last = None

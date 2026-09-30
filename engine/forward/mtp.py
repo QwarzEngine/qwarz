@@ -8,12 +8,16 @@ kept tokens are written again.
 """
 from __future__ import annotations
 
-DRAFT_TOKENS = 6
+import os
+
+# Proposals per window. The verify window (DRAFT_TOKENS + 1) must stay within
+# the XQA short-query path and the GDN rewind stash, both at most 8 rows.
+DRAFT_TOKENS = min(max(int(os.environ.get("QWARZ_DRAFT_TOKENS", "6")), 1), 7)
 
 
 def accepted_prefix(draft, verified):
     if not draft or len(draft) > DRAFT_TOKENS:
-        raise ValueError("MTP6 proposes 1..6 tokens")
+        raise ValueError(f"MTP proposes 1..{DRAFT_TOKENS} tokens")
     count = 0
     for proposed, sampled in zip(draft, verified):
         if proposed != sampled:

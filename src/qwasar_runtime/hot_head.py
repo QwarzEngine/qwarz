@@ -33,8 +33,17 @@ from pathlib import Path
 import types
 
 REVISION = "hot64k-20260922-promoted"
-MAP_PATH = Path(__file__).with_name("hot_blocks_64k.txt")
-MAP_SHA256 = "352e5e2d449bb07edfa15ae119fda80c9231a163500f6d37f8c3c5f76422f003"
+# Pinned maps. "matrix" is the 2026-09-22 promotion; "traffic" is recalibrated
+# on served agentic traffic (held-out output coverage 98.6% vs 96.9%).
+MAPS = {
+    "matrix": ("hot_blocks_64k.txt", "352e5e2d449bb07edfa15ae119fda80c9231a163500f6d37f8c3c5f76422f003"),
+    "traffic": ("hot_blocks_64k_traffic.txt", "bdc0c7ccafeeacc0133b12eb7bba157bc8922d80bdbad1914bebf916447334de"),
+}
+MAP_NAME = os.environ.get("QWASAR_HOT_MAP", "matrix")
+if MAP_NAME not in MAPS:
+    raise ValueError(f"QWASAR_HOT_MAP must be one of {sorted(MAPS)}")
+MAP_PATH = Path(__file__).with_name(MAPS[MAP_NAME][0])
+MAP_SHA256 = MAPS[MAP_NAME][1]
 SUBSET_VOCAB = 65536
 
 

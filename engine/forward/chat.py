@@ -10,12 +10,22 @@ from __future__ import annotations
 
 import time
 
+import os
+
 from engine.forward.cycle import _stop_requested
 from engine.forward.sample import chooser
 from qwasar_runtime.engine import incomplete_reason_from_error, reasoning_token_cap, tool_error_summary
 from qwasar_runtime.parsing import StreamParser, canonical, image_parts, validate_messages
 from qwasar_runtime.rendering import REASONING_CLOSE, encode, render
 from qwasar_runtime.vision import MAX_IMAGES, decode_image_data
+
+
+# The model card's sampler for thinking mode: temperature 1.0, top_p 0.95,
+# top_k 20, min_p 0. The ExLlama worker has always applied top_k 20.
+TOP_K = int(os.environ.get("QWARZ_TOP_K", "20"))
+# Sampled drafts with the min(1, p/q) test instead of greedy drafts with an
+# exact-match test. Both keep the target's law; this one accepts more.
+SPECULATIVE = os.environ.get("QWARZ_SPEC_SAMPLING", "1") != "0"
 
 
 def decode_tokens(tokenizer, ids):
@@ -50,6 +60,44 @@ def _stream_piece(previous, text, hold_replacement):
     while index < limit and previous[index] == stable[index]:
         index += 1
     return stable[index:], stable
+
+
+class IncrementalText:
+    """Decode only the tail since the last complete-character anchor.
+
+    Re-decoding every visible token on every window grew with the answer
+    (2.8 ms per window at 32K tokens, with the GPU idle). A byte-level decode
+    of two pieces split at a complete character equals the decode of the
+    whole, so the anchor moves only when the tail ends on one.
+    """
+
+    SPAN = 32
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.ids = []
+        self.anchor = 0
+        self.fed = ""
+
+    def push(self, ids):
+        self.ids.extend(int(token) for token in ids)
+        tail = decode_tokens(self.tokenizer, self.ids[self.anchor:])
+        piece, self.fed = _stream_piece(self.fed, tail, True)
+        if (
+            len(self.ids) - self.anchor >= self.SPAN
+            and self.fed == tail
+            and not tail.endswith("\ufffd")
+        ):
+            self.anchor = len(self.ids)
+            self.fed = ""
+        return piece
+
+    def flush(self):
+        if self.anchor >= len(self.ids):
+            return ""
+        tail = decode_tokens(self.tokenizer, self.ids[self.anchor:])
+        piece, self.fed = _stream_piece(self.fed, tail, False)
+        return piece
 
 
 def prepare_chat(tokenizer, request, parent, context, embedder=None):
@@ -106,9 +154,37 @@ def prepare_chat(tokenizer, request, parent, context, embedder=None):
         "close_ids": encode(tokenizer, REASONING_CLOSE),
         "temperature": None if "temperature" not in request else float(request["temperature"]),
         "top_p": 0.95 if top_p is None else float(top_p),
+        "top_k": TOP_K,
+        "vocab": _vocab(tokenizer),
+        "cuts": prefix_cuts(tokens),
         "seed": seed,
         "images": images,
     }
+
+
+IM_START = 248045
+
+
+def prefix_cuts(tokens, page=256):
+    """Page floors of the two prefixes a later session is likely to share.
+
+    The end of the system block (system prompt and tools) is shared by every
+    new session of the same client; the start of the last message is the
+    history an edited or regenerated turn keeps.
+    """
+    starts = [index for index, token in enumerate(tokens) if token == IM_START]
+    cuts = set()
+    if len(starts) >= 2:
+        cuts.add(starts[1] // page * page)
+    if len(starts) >= 3:
+        cuts.add(starts[-2] // page * page)
+    return sorted(cut for cut in cuts if cut > 0)
+
+
+def _vocab(tokenizer):
+    """Ids the tokenizer can decode. The output head pads past them."""
+    size = getattr(tokenizer, "actual_vocab_size", None)
+    return int(size) if isinstance(size, int) and size > 0 else None
 
 
 def _sampling(request, name, low, high, exclusive_low=False):
@@ -162,7 +238,10 @@ def _target_choose(runner, prepared):
         return None
     if temperature is None:
         temperature = 1.0
-    return chooser(float(temperature), float(prepared.get("top_p", 0.95)), int(prepared.get("seed", 42)))
+    return chooser(
+        float(temperature), float(prepared.get("top_p", 0.95)), int(prepared.get("seed", 42)),
+        top_k=int(prepared.get("top_k", TOP_K)), vocab=prepared.get("vocab"), speculative=SPECULATIVE,
+    )
 
 
 def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, embed_ids=None, inv_freq=None):
@@ -178,7 +257,7 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
     state = {
         "seen": 0,
         "visible": [],
-        "prev": "",
+        "text": IncrementalText(tokenizer),
         "streamed": {"content": 0, "reasoning": 0},
         "reasoning_tokens": 0,
         "close_reason": None,
@@ -220,9 +299,7 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
             state["reasoning_tokens"] += len(new)
         if visible:
             state["visible"].extend(int(token) for token in visible)
-            text = decode_tokens(tokenizer, state["visible"])
-            piece, state["prev"] = _stream_piece(state["prev"], text, True)
-            feed(piece, now)
+            feed(state["text"].push(visible), now)
         state["seen"] = len(produced)
         if _stop_requested(cancel):
             return None
@@ -242,12 +319,11 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
     result = session.generate(
         prepared["tokens"], maximum, stop_ids={stop}, choose=_target_choose(session.runner, prepared),
         on_accepted=on_accepted, cancel=cancel, embed_ids=embed_ids, inv_freq=inv_freq,
+        cuts=prepared.get("cuts"),
     )
     finished = time.perf_counter()
     if state["visible"]:
-        final = decode_tokens(tokenizer, state["visible"])
-        piece, state["prev"] = _stream_piece(state["prev"], final, False)
-        feed(piece, finished)
+        feed(state["text"].flush(), finished)
     produced = list(result["tokens"])
     status = "completed"
     incomplete = None

@@ -14,7 +14,15 @@ prefix uses the production cuts and leaves the last prompt id held out.
 """
 from __future__ import annotations
 
+import os
+
 from engine.forward.schedule import suffix_bounds
+
+# Prefix marks: pinned host copies of the recurrent state at prefill cuts.
+# A new session that shares only part of the resident tape (the same system
+# prompt, an edited last message) restores the longest shared mark instead of
+# prefilling from zero. Each mark is ~151 MB of host memory. 0 disables.
+PREFIX_MARKS = int(os.environ.get("QWARZ_PREFIX_MARKS", "12"))
 
 
 def _forward_span(runner, ids, start, end, embedded, inv_freq):
@@ -49,8 +57,79 @@ class Session:
         self.busy = False
         self.cycle = None
         self._draft_mark = None
+        self.marks = {}
+        self._spare_draft = None
 
-    def _rewind_to_commit_or_zero(self, shared):
+    def _zero(self):
+        """Forget the tape. The runner keeps its pages and graphs when it can."""
+        draft = self.cycle.draft if self.cycle is not None else None
+        rezero = getattr(self.runner, "rezero", None)
+        if callable(rezero) and getattr(self.runner, "states", None):
+            rezero()
+            reset = getattr(draft, "reset", None)
+            if callable(reset):
+                reset()
+                self._spare_draft = draft
+        else:
+            self.runner.reset()
+            self._spare_draft = None
+        self.snapshot = None
+        self.tape = []
+        self.cursor = 0
+        self.committed = 0
+        self.cycle = None
+        self._draft_mark = None
+        self.marks.clear()
+
+    def _new_cycle(self):
+        from engine.forward.cycle import DraftCycle
+
+        spare, self._spare_draft = self._spare_draft, None
+        return DraftCycle(self.runner, draft=spare)
+
+    def _on_span(self, end, carry):
+        """Mark the prefix that ends at this prefill cut."""
+        if PREFIX_MARKS <= 0 or end in self.marks:
+            return
+        capture = getattr(self.runner, "capture_host", None)
+        if not callable(capture):
+            return
+        slot = None
+        if len(self.marks) >= PREFIX_MARKS:
+            # Drop the mark whose removal leaves the smallest gap. The first
+            # (shared system prompt) and the last (this prompt) stay.
+            ordered = sorted(self.marks)
+            if len(ordered) < 3:
+                return
+            victim = min(range(1, len(ordered) - 1), key=lambda i: ordered[i + 1] - ordered[i - 1])
+            slot, _carry = self.marks.pop(ordered[victim])
+        if carry is not None and callable(getattr(carry, "clone", None)):
+            carry = carry.clone()
+        self.marks[end] = (capture(slot), carry)
+
+    def _restore_mark(self, limit):
+        if not self.marks or self.cycle is None or self.cycle.draft is None:
+            return False
+        best = max((position for position in self.marks if 0 < position <= limit), default=None)
+        if best is None:
+            return False
+        state, carry = self.marks[best]
+        try:
+            self.cycle.draft.truncate(best)
+        except Exception:
+            return False
+        self.runner.restore(state)
+        self.cursor = best
+        self.committed = best
+        self.tape = self.tape[:best]
+        self.snapshot = self.runner.capture()
+        self.cycle.carry = carry
+        self._draft_mark = (best, carry, self.cycle.accepted, self.cycle.rejected, self.cycle.primed)
+        for position in [position for position in self.marks if position > best]:
+            del self.marks[position]
+        return True
+
+    def _rewind_to_commit_or_zero(self, shared, limit=None):
         if shared >= self.cursor:
             return
         if self.snapshot is not None and shared >= self.committed:
@@ -62,12 +141,9 @@ class Session:
             ):
                 self.cycle = None
             return
-        self.runner.reset()
-        self.snapshot = None
-        self.tape = []
-        self.cursor = 0
-        self.committed = 0
-        self.cycle = None
+        if self._restore_mark(shared if limit is None else min(shared, limit)):
+            return
+        self._zero()
 
     def prefill(self, ids, embedded=None, inv_freq=None):
         ids = list(ids)
@@ -89,7 +165,7 @@ class Session:
 
     def generate(
         self, ids, max_new, stop_ids=None, choose=None, on_accepted=None, cancel=None,
-        embed_ids=None, inv_freq=None,
+        embed_ids=None, inv_freq=None, cuts=None,
     ):
         """Emit MTP6 tokens. The last prompt id stays out of the prefill.
 
@@ -114,30 +190,27 @@ class Session:
             shared = 0
             while shared < len(self.tape) and shared < len(ids) and self.tape[shared] == ids[shared]:
                 shared += 1
-            self._rewind_to_commit_or_zero(shared)
+            self._rewind_to_commit_or_zero(shared, limit=len(ids) - 1)
             if self.cycle is not None and self.cycle.draft is not None and self.cycle.draft.position != self.cursor:
                 self.cycle = None
             if self.cycle is None and self.cursor:
-                self.runner.reset()
-                self.snapshot = None
-                self.tape = []
-                self.cursor = 0
-                self.committed = 0
-                self._draft_mark = None
+                self._zero()
             if ids[:self.cursor] != self.tape[:self.cursor]:
                 raise RuntimeError("resident tape does not match the prompt prefix")
             cached_tokens = self.cursor
             if self.cycle is None:
-                self.cycle = DraftCycle(self.runner)
+                self.cycle = self._new_cycle()
+            accepted_before = self.cycle.accepted
+            rejected_before = self.cycle.rejected
             try:
                 tokens, self.cycle = continue_drafted(
                     self.runner, ids, max_new, cycle=self.cycle, start=self.cursor,
                     stop_ids=stop_ids, choose=choose, on_accepted=on_accepted,
-                    cancel=cancel, embed_ids=embed_ids, inv_freq=inv_freq,
+                    cancel=cancel, embed_ids=embed_ids, inv_freq=inv_freq, on_span=self._on_span, cuts=cuts,
                 )
             except CancelledTurn as cancelled:
-                accepted = self.cycle.accepted if self.cycle is not None else 0
-                rejected = self.cycle.rejected if self.cycle is not None else 0
+                accepted = self.cycle.accepted - accepted_before if self.cycle is not None else 0
+                rejected = self.cycle.rejected - rejected_before if self.cycle is not None else 0
                 produced = list(cancelled.produced)
                 prefill_s = getattr(self.cycle, "host_prefill_s", None) if self.cycle is not None else None
                 self.cancel()
@@ -154,8 +227,8 @@ class Session:
                 raise RuntimeError("drafted cache diverged from the emitted tokens")
             self.tape = (ids + list(self.cycle.tokens))[:self.cycle.cache_len]
             self.cursor = self.cycle.cache_len
-            accepted = self.cycle.accepted
-            rejected = self.cycle.rejected
+            accepted = self.cycle.accepted - accepted_before
+            rejected = self.cycle.rejected - rejected_before
             self.commit()
             return {
                 "status": "completed",
@@ -233,12 +306,7 @@ class Session:
 
     def cancel(self):
         if self.snapshot is None:
-            self.runner.reset()
-            self.tape = []
-            self.cursor = 0
-            self.committed = 0
-            self.cycle = None
-            self._draft_mark = None
+            self._zero()
         else:
             self.runner.restore(self.snapshot)
             self.cursor = self.committed
