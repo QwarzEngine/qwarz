@@ -75,6 +75,32 @@ Rollback to the pre-XQA stack: `--prefill flash` in
 `QWASAR_RDZ=0` disables the rendezvous path at boot; `QWASAR_HOT64K=0`
 disables the 64K proposer head (full 248320-token proposer) at boot.
 
+### The resident engine (`engine.forward`)
+
+The supervisor launches the resident engine by default; `QWASAR_WORKER=exllama`
+in the unit brings back the ExLlamaV3 worker above. The 2026-09-29 campaign
+(`docs/benchmarks/2026-09-29-trafico-real.md`) measured it on replayed
+production requests and fixed or added:
+
+| switch (default) | what it does |
+|---|---|
+| — | GDN rewind stash allocated once (a two-token reasoning close used to corrupt the state into `!!!!`); fresh graph pool after `reset()` (the second session used to crash the worker) |
+| `QWARZ_TOP_K` (20) | the model card's thinking sampler (T=1, top_p 0.95, top_k 20) with ExLlama's exact top-p rule (the token that crosses top_p is dropped), padding rows of the head excluded, whole window sampled on device |
+| `QWARZ_SPEC_SAMPLING` (1) | sampled drafts verified with the min(1, p/q) ratio test; keeps the target's law, accepts more at T>0 |
+| `QWARZ_PREFIX_MARKS` (12) | pinned host copies of the GDN state at prefill cuts, the end of the system block and the last message; a new session restores the longest shared prefix |
+| `QWARZ_REWIND_GRAPH` (1) | the GDN rewind after a verify is one CUDA graph per accepted length |
+| `QWARZ_DRAFT_GRAPH` (1) | the six MTP steps are one CUDA graph (Triton split-K decode attention, preallocated draft KV) |
+| `QWARZ_DRAFT_KV8` (1) | the graphed draft steps read an FP8 shadow of the draft KV; drafts only steer speed |
+| `QWARZ_WARMUP` (1) | first-request kernels compiled and graphs captured before `ready` |
+| `QWARZ_DRAFT_TOKENS` (6), `QWARZ_NGRAM` (0), `QWASAR_HOT_MAP` (`matrix`) | measured alternatives that did not win: k=5/7, suffix drafting, the traffic-calibrated proposer map |
+
+Every draft-side switch leaves the emitted distribution unchanged: each token
+is still the verifier's. Real-traffic replay (18 agentic turns): 139 tok/s end
+to end and 183 tok/s decode, against 121 and 154 on the ExLlama worker. The
+37-cell gate still reads code 23/32 against ExLlama's 24/32 on the same day
+(JSON 4/4, acceptance +1.7 pp, memory +0.32 GiB): within the matrix noise but
+not the strict "not worse" rule, so the rollback switch stays documented.
+
 Pinned artifact: `thelastspark/Qwen3.8-27B-exl3` @
 `1a6fe4afb5b921fda9f93fd4b06d6c6d5c99a62c`, three shards, 19.9 GB, SHA-256
 verified against the frozen manifest. The NVIDIA64 donor is pinned by hash in
