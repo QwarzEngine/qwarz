@@ -20,6 +20,8 @@ pub struct WorkerConfig {
     pub prefill: String,
     pub context_size: usize,
     pub fake: bool,
+    /// Serve with the ExLlamaV3 generator instead of the resident engine.
+    pub exllama: bool,
     pub request_timeout: Duration,
     pub cancel_timeout: Duration,
 }
@@ -28,8 +30,9 @@ pub struct WorkerConfig {
 ///
 /// `qwarz start` leaves `fake` false, so that process is the resident engine.
 /// `--fake-worker` keeps the chat fixture the HTTP contract tests already drive.
+/// `exllama` (`QWASAR_WORKER=exllama`) is the rollback to the ExLlamaV3 worker.
 fn worker_arguments(config: &WorkerConfig) -> Vec<String> {
-    let module = if config.fake {
+    let module = if config.fake || config.exllama {
         "qwasar_runtime.worker"
     } else {
         "engine.forward.worker"
@@ -325,6 +328,7 @@ mod tests {
             prefill: "xqa".into(),
             context_size: 262144,
             fake,
+            exllama: false,
             request_timeout: Duration::from_secs(600),
             cancel_timeout: Duration::from_secs(30),
         }
@@ -338,6 +342,16 @@ mod tests {
         assert_eq!(args[2], "engine.forward.worker");
         assert!(args.iter().any(|arg| arg == "xqa"));
         assert!(!args.iter().any(|arg| arg.contains("qwasar_runtime")));
+        assert!(!args.iter().any(|arg| arg == "--fake"));
+    }
+
+    #[test]
+    fn exllama_rollback_spawns_the_generator_worker() {
+        let mut rollback = config(false);
+        rollback.exllama = true;
+        let args = worker_arguments(&rollback);
+        assert_eq!(args[2], "qwasar_runtime.worker");
+        assert!(args.iter().any(|arg| arg == "xqa"));
         assert!(!args.iter().any(|arg| arg == "--fake"));
     }
 }

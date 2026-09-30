@@ -24,6 +24,7 @@ fn spawn_worker(mode: &str) -> Arc<Worker> {
         prefill: "baseline".into(),
         context_size: 1024,
         fake: true,
+        exllama: false,
         request_timeout: Duration::from_secs(600),
         cancel_timeout: Duration::from_secs(30),
     })

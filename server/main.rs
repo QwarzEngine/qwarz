@@ -18,6 +18,7 @@ async fn run() -> Result<(), String> {
         prefill: "flash".into(),
         context_size: 262144,
         fake: false,
+        exllama: std::env::var("QWASAR_WORKER").is_ok_and(|worker| worker == "exllama"),
         request_timeout: std::time::Duration::from_secs(600),
         cancel_timeout: std::time::Duration::from_secs(30),
     };
