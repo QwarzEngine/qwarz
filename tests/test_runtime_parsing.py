@@ -213,6 +213,32 @@ class ParserTests(unittest.TestCase):
         arguments = json.loads(parser.finish()["tool_calls"][0]["function"]["arguments"])
         self.assertEqual(arguments["options"], [{"title": "Go ahead"}, {"title": "Stop"}])
 
+    def test_parameter_value_may_contain_a_tool_call_example(self):
+        tools = [{"type": "function", "function": {"name": "Edit", "parameters": {
+            "type": "object", "properties": {
+                "file_path": {"type": "string"}, "new_string": {"type": "string"}},
+            "required": ["file_path", "new_string"]}}}]
+        example = ("parser.feed('<tool_call><function=grep><parameter=pattern>TODO</parameter>'\\n"
+                   "            '<parameter=mode>auto</parameter></function></tool_call>')")
+        parser = StreamParser("off", tools, "resp_edit")
+        parser.feed(
+            "<tool_call>\n<function=Edit>\n"
+            "<parameter=file_path>\n/tmp/test_runtime_parsing.py\n</parameter>\n"
+            f"<parameter=new_string>\n{example}\n</parameter>\n"
+            "</function>\n</tool_call>\n"
+            "<tool_call>\n<function=Edit>\n"
+            "<parameter=file_path>\n/tmp/next.py\n</parameter>\n"
+            "<parameter=new_string>\nnext\n</parameter>\n"
+            "</function>\n</tool_call>")
+        message = parser.finish()
+        self.assertEqual(len(message["tool_calls"]), 2)
+        first, second = (json.loads(call["function"]["arguments"]) for call in message["tool_calls"])
+        self.assertEqual(first["new_string"], example)
+        self.assertIn("</parameter>", first["new_string"])
+        self.assertIn("</tool_call>", first["new_string"])
+        self.assertEqual(second["new_string"], "next")
+        self.assertEqual(second["file_path"], "/tmp/next.py")
+
     def test_unclosed_tool_xml_is_detected_without_treating_closed_junk_as_incomplete(self):
         cut = StreamParser("off", TOOLS, "resp_a")
         cut.feed("<tool_call><function=edit><parameter=path>a.py")

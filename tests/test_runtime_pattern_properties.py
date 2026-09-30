@@ -107,6 +107,52 @@ def test_format_schema_is_enforced():
         validate_schema({"type": "string", "format": ""})
 
 
+def test_grok_tool_schema_not_excludes_the_other_forms():
+    branch = {
+        "type": "object",
+        "properties": {
+            "tool_name": {"type": "string"},
+            "tool_input": {"type": "object"},
+        },
+        "required": ["tool_name", "tool_input"],
+        "not": {"anyOf": [{"required": ["tool_input_file"]}, {"required": ["file"]}]},
+    }
+    schema = {"oneOf": [branch, {
+        "type": "object",
+        "properties": {"file": {"type": "string"}},
+        "required": ["file"],
+        "not": {"anyOf": [{"required": ["tool_name"]}, {"required": ["tool_input"]}]},
+    }]}
+    validate_tools([{"type": "function", "function": {"name": "use_tool", "parameters": schema}}])
+    validate_value({"tool_name": "grep", "tool_input": {"pattern": "x"}}, branch)
+    with pytest.raises(ValueError):
+        validate_value({"tool_name": "grep", "tool_input": {}, "file": "args.json"}, branch)
+
+
+def test_not_schema_is_enforced():
+    schema = {"type": "string", "not": {"enum": [""]}}
+    validate_schema(schema)
+    validate_value("value", schema)
+    with pytest.raises(ValueError):
+        validate_value("", schema)
+
+
+def test_not_with_type_and_nested_schemas():
+    schema = {"not": {"type": "string"}}
+    validate_schema(schema)
+    validate_value(3, schema)
+    with pytest.raises(ValueError):
+        validate_value("3", schema)
+    nested = {"type": "object", "properties": {"mode": {"type": "string", "not": {"enum": ["auto"]}}},
+              "additionalProperties": False}
+    validate_schema(nested)
+    validate_value({"mode": "strict"}, nested)
+    with pytest.raises(ValueError):
+        validate_value({"mode": "auto"}, nested)
+    with pytest.raises(ValueError):
+        validate_schema({"not": {"unsupported": True}})
+
+
 def test_native_pattern_string_parameter_is_not_coerced_to_number():
     tools = [{"type": "function", "function": {"name": "labels", "parameters": {
         "type": "object", "patternProperties": {"^label_": {"type": "string"}}, "additionalProperties": False}}}]

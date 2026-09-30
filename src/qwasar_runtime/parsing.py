@@ -14,9 +14,8 @@ from urllib.parse import urlsplit
 # XML-safe so they cannot close a <parameter=...> tag or inject native roles.
 NAME_BODY = r"[A-Za-z0-9_-]{1,128}"
 NAME = re.compile(NAME_BODY + r"\Z")
-TOOL_CALL = re.compile(
-    rf"<tool_call>\s*<function=({NAME_BODY})>(.*?)</function>\s*</tool_call>", re.S)
-PARAMETER = re.compile(rf"\s*<parameter=({NAME_BODY})>(.*?)</parameter>", re.S)
+FUNCTION_OPEN = re.compile(rf"\s*<function=({NAME_BODY})>", re.S)
+PARAMETER_OPEN = re.compile(rf"\s*<parameter=({NAME_BODY})>", re.S)
 EMAIL = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z")
@@ -194,7 +193,7 @@ def validate_schema(schema, depth=0):
     supported = {"type", "properties", "patternProperties", "propertyNames", "required", "additionalProperties",
         "items", "prefixItems", "minItems", "maxItems",
         "uniqueItems", "minLength", "maxLength", "pattern", "format", "minimum", "maximum", "exclusiveMinimum",
-        "exclusiveMaximum", "enum", "const", "anyOf", "oneOf", "allOf", "$ref", "$defs", "definitions",
+        "exclusiveMaximum", "enum", "const", "anyOf", "oneOf", "allOf", "not", "$ref", "$defs", "definitions",
         "$schema", "$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"}
     unknown = schema.keys() - supported
     if unknown:
@@ -230,6 +229,8 @@ def validate_schema(schema, depth=0):
                 raise ValueError(f"{keyword} must be a nonempty array")
             for child in schema[keyword]:
                 validate_schema(child, depth + 1)
+    if "not" in schema:
+        validate_schema(schema["not"], depth + 1)
     required = schema.get("required", [])
     if not isinstance(required, list) or any(not isinstance(name, str) for name in required) or len(required) != len(set(required)):
         raise ValueError("required must contain unique property names")
@@ -301,6 +302,13 @@ def _validate_value(value, schema, root, path):
             if (keyword == "anyOf" and not matches or keyword == "oneOf" and matches != 1
                     or keyword == "allOf" and matches != len(schema[keyword])):
                 raise ValueError(f"value does not satisfy {keyword}")
+    if "not" in schema:
+        try:
+            validate_value(value, schema["not"], root, path)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("value matches prohibited schema")
     expected = schema.get("type")
     types = {"string": isinstance(value, str), "object": isinstance(value, dict),
              "array": isinstance(value, list), "integer": type(value) is int,
@@ -541,6 +549,112 @@ def message_key(message):
     return canonical({key: value for key, value in message.items() if key != "reasoning_content"})
 
 
+def _close_positions(text, tag, start):
+    needle = f"</{tag}>"
+    positions = []
+    index = text.find(needle, start)
+    while index >= 0:
+        positions.append(index)
+        index = text.find(needle, index + len(needle))
+    return positions
+
+
+def _parameter_text(value):
+    if value.startswith("\n"):
+        value = value[1:]
+    if value.endswith("\n"):
+        value = value[:-1]
+    return value
+
+
+def _parse_parameters(body):
+    """Parameter list, or None when `body` is not one.
+
+    A value may contain `</parameter>` (the model pasting a tool-call example
+    into an edit). The earliest close whose remainder is itself a parameter
+    list wins, so a repeated name stays a duplicate instead of being swallowed.
+    """
+    memo = {}
+
+    def parse_from(pos):
+        if pos in memo:
+            return memo[pos]
+        if not body[pos:].strip():
+            memo[pos] = []
+            return []
+        match = PARAMETER_OPEN.match(body, pos)
+        if not match:
+            memo[pos] = None
+            return None
+        for close in _close_positions(body, "parameter", match.end()):
+            tail = parse_from(close + len("</parameter>"))
+            if tail is None:
+                continue
+            result = [(match.group(1), _parameter_text(body[match.end():close])), *tail]
+            memo[pos] = result
+            return result
+        memo[pos] = None
+        return None
+
+    return parse_from(0)
+
+
+def _parse_function(interior):
+    match = FUNCTION_OPEN.match(interior)
+    if not match:
+        return None
+    for close in _close_positions(interior, "function", match.end()):
+        if interior[close + len("</function>"):].strip():
+            continue
+        parameters = _parse_parameters(interior[match.end():close])
+        if parameters is None:
+            continue
+        return match.group(1), parameters
+    return None
+
+
+def _next_tool_call(xml):
+    """First call plus the unparsed remainder.
+
+    Prefers a close whose remainder is empty or itself a call list. A following
+    call that does not parse stays in the remainder so the caller can report
+    that later call; an earlier close is kept only when no complete split works.
+    """
+    if not xml.startswith("<tool_call>"):
+        raise ValueError("malformed native tool call")
+    fallback = None
+    for close in _close_positions(xml, "tool_call", len("<tool_call>")):
+        function = _parse_function(xml[len("<tool_call>"):close])
+        if function is None:
+            continue
+        rest = xml[close + len("</tool_call>"):].strip()
+        if not rest or _tool_calls_parse(rest):
+            return function, rest
+        if fallback is None and rest.startswith("<tool_call>"):
+            fallback = (function, rest)
+    if fallback is not None:
+        return fallback
+    raise ValueError("malformed native tool call")
+
+
+def _parse_tool_calls(xml):
+    """Returns (name, [(parameter, text), ...]) for each native tool call."""
+    xml = xml.strip()
+    calls = []
+    while xml:
+        function, xml = _next_tool_call(xml)
+        calls.append(function)
+    return calls
+
+
+def _tool_calls_parse(xml):
+    try:
+        _parse_tool_calls(xml)
+    except ValueError:
+        return False
+    return True
+
+
 class StreamParser:
     def __init__(self, thinking, tools, response_id, tool_choice="auto"):
         self.channel = "content" if thinking == "off" else "reasoning"
@@ -604,11 +718,11 @@ class StreamParser:
         if not self.in_tools:
             return False
         remaining = self.xml.strip()
-        while remaining:
-            match = TOOL_CALL.match(remaining)
-            if match:
-                remaining = remaining[match.end():].strip()
-                continue
+        if not remaining:
+            return False
+        try:
+            _parse_tool_calls(remaining)
+        except ValueError:
             return remaining.startswith("<tool_call>") and "</tool_call>" not in remaining
         return False
 
@@ -622,10 +736,7 @@ class StreamParser:
             remaining = self.xml.strip()
             while remaining:
                 self.tool_diagnostic.update(tool=None, parsed_arguments={}, stage="native_parse", call_index=len(calls))
-                match = TOOL_CALL.match(remaining)
-                if not match:
-                    raise ValueError("malformed native tool call")
-                name, parameters = match.group(1, 2)
+                (name, parameters), remaining = _next_tool_call(remaining)
                 self.tool_diagnostic["tool"] = name
                 if name not in self.functions or self.tool_choice == "none":
                     raise ValueError("undeclared or prohibited tool")
@@ -633,21 +744,14 @@ class StreamParser:
                     raise ValueError("tool does not match tool_choice")
                 schema, arguments = self.functions[name], {}
                 self.tool_diagnostic["parsed_arguments"] = arguments
-                while parameters.strip():
-                    parameter = PARAMETER.match(parameters)
-                    if not parameter or parameter[1] in arguments:
+                for key, value in parameters:
+                    if key in arguments:
                         raise ValueError("malformed or duplicate parameter")
-                    key, value = parameter.group(1, 2)
-                    if value.startswith("\n"):
-                        value = value[1:]
-                    if value.endswith("\n"):
-                        value = value[:-1]
                     try:
                         value = parse_tool_parameter(value, property_schemas(schema, key))
                     except ValueError:
                         raise ValueError(f"invalid JSON value for {key}")
                     arguments[key] = value
-                    parameters = parameters[parameter.end():]
                 arguments = coerce_arguments(arguments, schema)
                 self.tool_diagnostic["parsed_arguments"] = arguments
                 self.tool_diagnostic["stage"] = "schema_validation"
@@ -665,7 +769,6 @@ class StreamParser:
                 call_id = "call_" + hashlib.sha256(f"{self.response_id}:{len(calls)}".encode()).hexdigest()[:24]
                 calls.append({"id": call_id, "type": "function", "function": {
                     "name": name, "arguments": canonical(arguments)}})
-                remaining = remaining[match.end():].strip()
             self.tool_diagnostic = None
         if complete and (self.tool_choice == "required" or isinstance(self.tool_choice, dict)) and not calls:
             raise ValueError("required tool call was not generated")

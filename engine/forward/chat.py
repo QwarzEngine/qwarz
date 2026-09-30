@@ -343,13 +343,16 @@ def run_turn(tokenizer, session, prepared, response_id, publish, cancel=None, em
     try:
         message = parser.finish(complete=status == "completed")
     except ValueError as error:
+        diagnostic = getattr(parser, "tool_diagnostic", None)
         message = parser.finish(complete=False)
         if status != "cancelled":
             status = "incomplete"
             if incomplete is None:
                 eos = "max_new_tokens" if not produced or produced[-1] != stop else "stop_token"
                 incomplete = incomplete_reason_from_error(error, {"eos_reason": eos})
-        tool_error = tool_error_summary(getattr(parser, "tool_diagnostic", None))
+        if isinstance(diagnostic, dict):
+            diagnostic = {**diagnostic, "error": {"class": type(error).__name__, "message": str(error)}}
+        tool_error = tool_error_summary(diagnostic)
     for channel, field in (("content", "content"), ("reasoning", "reasoning_content")):
         tail = message[field][state["streamed"][channel]:]
         if tail:
